@@ -15,8 +15,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let opts = OptsBuilder::default()
         .ip_or_hostname("localhost")
         .user(Some("root"))
-        .pass(Some("baikai#1234"))
-        .tcp_port(3310)
+        .pass(Some("123456"))
+        .tcp_port(3312)
         .init(vec!["SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1"]);
 
     let pool = Pool::new(opts);
@@ -24,8 +24,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     println!("conn: {:?}", conn);
 
     let request = BinlogStreamRequest::new(3000)
-        .with_filename(b"mysql-bin.000003")
-        .with_pos(389);
+        .with_filename(b"binlog.000002")
+        .with_pos(157);
     let mut binlog_stream = conn.get_binlog_stream(request).await?;
 
     let mut events_num = 0;
