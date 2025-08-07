@@ -6,38 +6,68 @@
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use mysql_async::{BinlogStreamRequest, OptsBuilder, Pool, prelude::*};
-use mysql_common::binlog::events::EventData;
+use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool, prelude::Queryable};
+use mysql_common::{binlog::events::EventData, packets::SemiSyncAckPacket};
 use tokio::time::timeout;
 
-#[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let opts = OptsBuilder::default()
-        .ip_or_hostname("localhost")
-        .user(Some("root"))
-        .pass(Some("123456"))
-        .tcp_port(3312)
-        .init(vec!["SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1"]);
+pub const REPLY_MAGIC_NUM_OFFSET: usize = 0;
+pub const K_PACKET_MAGIC_NUM: u8 = 0xef;
+pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
+pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
-    let pool = Pool::new(opts);
-    let conn = pool.get_conn().await?;
-    println!("conn: {:?}", conn);
+async fn send_ack(conn: &mut Conn, position: u64, filename: String) {
+    let ack_packet = SemiSyncAckPacket::new(position, filename.as_bytes());
+    conn.write_struct2(&ack_packet).await.unwrap();
+}
 
-    let request = BinlogStreamRequest::new(3000)
-        .with_filename(b"binlog.000002")
-        .with_pos(157);
+async fn pull_binlog_events(
+    conn: Conn,
+    mut log_file_pos: u64,
+    mut log_file_name: String,
+    server_id: u32,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let request = BinlogStreamRequest::new(server_id)
+        .with_filename(log_file_name.as_bytes())
+        .with_pos(log_file_pos);
+
     let mut binlog_stream = conn.get_binlog_stream(request).await?;
 
     let mut events_num = 0;
     while let Some(event) = binlog_stream.next().await {
-
-        let event = event.unwrap();
+        let event = match event {
+            Ok(evt) => evt,
+            Err(e) => {
+                println!("event:unwrap:: {:?}", e);
+                continue;
+            }
+        };
         events_num += 1;
 
+        log_file_pos = event.header().log_pos() as u64;
         // assert that event type is known
-        event.header().event_type().unwrap();
+        let event_type = event.header().event_type().unwrap();
+        match event_type {
+            // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_replication_binlog_event.html#sect_protocol_replication_event_rotate
+            // Binlog Management
+            // The first event is either a START_EVENT_V3 or a FORMAT_DESCRIPTION_EVENT while the last event is either a STOP_EVENT or ROTATE_EVENT.
+            mysql_async::binlog::EventType::ROTATE_EVENT => {
+                // https://dev.mysql.com/doc/dev/mysql-server/latest/classmysql_1_1binlog_1_1event_1_1Rotate__event.html#details
+                // The layout of Rotate_event data part is as follows:
+                // +-----------------------------------------------------------------------+
+                // | common_header | post_header | position of the first event | file name |
+                log_file_name = String::from_utf8_lossy(&event.data()[1..]).to_string();
+            }
+            _ => {}
+        }
 
+        println!(
+            "log_file_name: {}, log_file_pos: {}",
+            log_file_name, log_file_pos
+        );
         println!("event: {:?}", event);
+
+        // send_ack(conn, log_file_pos, log_file_name.clone());
+        // conn.last_ok_packet()
 
         // iterate over rows of an event
         if let EventData::RowsEvent(re) = event.read_data()?.unwrap() {
@@ -54,6 +84,38 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .unwrap();
     println!("exit");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let init = vec![
+        "SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1, @server_id=3000, @replica_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005', @slave_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
+    ];
+
+    let opts = OptsBuilder::default()
+        .ip_or_hostname("localhost")
+        .user(Some("root"))
+        .pass(Some("123456"))
+        .max_allowed_packet(Some(67108864))
+        .tcp_port(3312)
+        .init(init);
+
+    let pool = Pool::new(opts);
+    let mut conn = pool.get_conn().await?;
+    println!("conn: {:?}", conn);
+
+    let log_file_name = "binlog.000002".to_owned();
+    let log_file_pos: u64 = 157;
+    let server_id: u32 = 3000;
+    {
+        let strings: Option<String> = conn
+            .query_first("select @@rpl_semi_sync_master_enabled")
+            .await?;
+        println!("rpl_semi_sync_master_enabled={}", strings.unwrap());
+    }
+
+    pull_binlog_events(conn, log_file_pos, log_file_name, server_id).await?;
 
     Ok(())
 }

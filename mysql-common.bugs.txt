@@ -1,0 +1,37 @@
+.\mysql_common-0.35.5\src\proto\codec\mod.rs#527
+
+if self.seq_id != chunk_info.seq_id() {
+                    match comp_seq_id {
+                        Some(seq_id) if seq_id == chunk_info.seq_id() => {
+                            // server syncronized pkt_nr (in `net_flush`)
+                            self.seq_id = seq_id;
+                        }
+                        _ => {
+                            +++++++
+                            self.seq_id = chunk_info.seq_id();                          <<<<<<<<<<<
+                            -------
+                            // return Err(PacketCodecError::PacketsOutOfSync);          <<<<<<<<<<<
+                        }
+                    }
+                }
+
+.\mysql_async-0.36.1\src\conn\binlog_stream\mod.rs#161
+
+if first_byte == Some(0) {
+    ++++++
+            println!("packet: {:?}", packet);      
+            let mut event_data = &packet[1..];
+            if event_data[0] == 0xef {
+                println!("slave semi-sync enabled");
+                if event_data[1] == 1 {
+                    println!("slave semi-sync status on");
+                } else {
+                    println!("slave semi-sync status off");
+                }
+                event_data = &packet[3..];
+            } else {
+                println!("slave semi-sync disabled");
+            }
+    +++++++         
+            match self.esr.read(event_data) {
+                Ok(Some(event)) => {
