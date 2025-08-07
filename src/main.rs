@@ -3,21 +3,23 @@
 // SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1
 // @master_binlog_checksum：MySQL在5.6版本之后为binlog引入了checksum机制，从库需要与主库相关参数保持一致。
 
-use std::time::Duration;
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use mysql_async::{
     BinlogStreamRequest, Conn, OptsBuilder, Pool, binlog::events::EventData, prelude::Queryable,
 };
-use tokio::time::timeout;
+use tokio::{sync::Mutex, time::timeout};
 
 pub const REPLY_MAGIC_NUM_OFFSET: usize = 0;
 pub const K_PACKET_MAGIC_NUM: u8 = 0xef;
 pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
+async fn send_ack(conn: &mut Conn, pos: u64, filename: &[u8]) {}
+
 async fn pull_binlog_events(
-    mut conn: Conn,
+    conn: Conn,
     mut log_file_pos: u64,
     mut log_file_name: String,
     server_id: u32,
@@ -28,8 +30,12 @@ async fn pull_binlog_events(
 
     let mut binlog_stream = conn.get_binlog_stream(request).await?;
     let mut events_num = 0;
-    while let Some(event) = binlog_stream.next().await {
-        let event = event.unwrap();
+    loop {
+        let event = if let Some(event) = binlog_stream.next().await {
+            event.unwrap()
+        } else {
+            break;
+        };
 
         events_num += 1;
 
@@ -55,6 +61,9 @@ async fn pull_binlog_events(
             log_file_name, log_file_pos
         );
         println!("event: {:?}", event);
+        // let mut conn_ = conn.lock().await;
+        conn.reply_ack(log_file_pos, log_file_name.as_bytes());
+        // send_ack(&mut conn, log_file_pos, log_file_name.as_bytes()).await;
 
         // iterate over rows of an event
         if let EventData::RowsEvent(re) = event.read_data()?.unwrap() {
@@ -103,6 +112,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let log_file_name = "mysql-bin.000002".to_owned();
     let log_file_pos: u64 = 126;
     let server_id: u32 = 3000;
+
     {
         let strings: Option<String> = conn
             .query_first("select @@rpl_semi_sync_master_enabled")
