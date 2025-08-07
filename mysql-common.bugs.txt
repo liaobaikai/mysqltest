@@ -32,6 +32,22 @@ if first_byte == Some(0) {
             } else {
                 println!("slave semi-sync disabled");
             }
+            // let event_data = &packet[1..];
     +++++++         
             match self.esr.read(event_data) {
                 Ok(Some(event)) => {
+
+
+
+./mysql_async-0.36.1/src/conn/binlog_stream/mod.rs
+
+impl super::Conn {
+
+// 响应ack
+    pub async fn reply_ack(&mut self, position: u64, filename: &[u8]) -> Result<()> {
+        let packet = SemiSyncAckPacket::new(position, filename);
+        self.write_struct(&packet).await?;
+        Ok(())
+    }
+
+}
