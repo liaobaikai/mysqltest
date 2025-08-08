@@ -7,16 +7,23 @@ use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use futures_util::{StreamExt, TryStreamExt};
 use mysql_async::{
-    BinlogStreamRequest, Conn, OptsBuilder, Pool, binlog::events::EventData, prelude::Queryable,
+    BinlogStream, BinlogStreamRequest, Conn, OptsBuilder, Pool, PoolConstraints, PoolOpts,
+    binlog::events::{Event, EventData},
+    prelude::Queryable,
 };
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    select,
+    sync::{Mutex, mpsc},
+    time::timeout,
+};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 pub const REPLY_MAGIC_NUM_OFFSET: usize = 0;
 pub const K_PACKET_MAGIC_NUM: u8 = 0xef;
 pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
-async fn send_ack(conn: &mut Conn, pos: u64, filename: &[u8]) {}
+
 
 async fn pull_binlog_events(
     conn: Conn,
@@ -27,15 +34,11 @@ async fn pull_binlog_events(
     let request = BinlogStreamRequest::new(server_id)
         .with_filename(log_file_name.as_bytes())
         .with_pos(log_file_pos);
-
-    let mut binlog_stream = conn.get_binlog_stream(request).await?;
     let mut events_num = 0;
-    loop {
-        let event = if let Some(event) = binlog_stream.next().await {
-            event.unwrap()
-        } else {
-            break;
-        };
+    let mut binlog_stream = conn.get_binlog_stream(request).await?;
+
+    while let Some(event) = binlog_stream.next().await {
+        let event = event.unwrap();
 
         events_num += 1;
 
@@ -60,9 +63,19 @@ async fn pull_binlog_events(
             "log_file_name: {}, log_file_pos: {}",
             log_file_name, log_file_pos
         );
+
+        let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
+        if semi_sync && need_ack {
+            binlog_stream
+                .get_conn_mut()
+                .reply_ack(log_file_pos, log_file_name.clone())
+                .await
+                .unwrap();
+        }
+
         println!("event: {:?}", event);
         // let mut conn_ = conn.lock().await;
-        conn.reply_ack(log_file_pos, log_file_name.as_bytes());
+        // conn.reply_ack(log_file_pos, log_file_name.as_bytes());
         // send_ack(&mut conn, log_file_pos, log_file_name.as_bytes()).await;
 
         // iterate over rows of an event
@@ -77,6 +90,45 @@ async fn pull_binlog_events(
     //     .reply_ack(log_file_pos, log_file_name.as_bytes())
     //     .await
     //     .unwrap();
+
+    // let (tx, _rx) = mpsc::unbounded_channel::<Event>();
+    // let mut rx = UnboundedReceiverStream::new(_rx);
+    // println!("conn: {:?}", binlog_stream.get_conn_mut());
+    // loop {
+    //     println!("aaaa");
+
+    //     select! {
+    //         Some(ret) = binlog_stream.next() => {
+    //             println!("{:?}", ret);
+    //             let event = match ret {
+    //                 Ok(evt) => evt,
+    //                 Err(e) => {
+    //                     return Err(Box::new(e));
+    //                 }
+    //             };
+
+    //             if let Err(e) = tx.send(event) {
+    //                 return Err(Box::new(e));
+    //             }
+    //         },
+    //         Some(event) = rx.next() => {
+    //             println!("pos: {}", event.header().log_pos());
+    //             println!("event: {:?}", event);
+
+    //             // send_semi_sync_ack(&mut conn_, event.header().log_pos() as u64).await?;
+
+    //             // binlog_stream.reply_ack(event.header().log_pos() as u64, "mysql-bin.000007".to_owned()).await;
+    //             // conn.query_drop("show databases").await;
+    //             let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
+    //             if semi_sync && need_ack {
+    //                 binlog_stream.get_conn_mut().reply_ack(event.header().log_pos() as u64, "mysql-bin.000008".to_string()).await.unwrap();
+    //             }
+    //         }
+    //         // else => {
+
+    //         // }
+    //     }
+    // }
 
     assert!(events_num > 0);
     timeout(Duration::from_secs(10), binlog_stream.close())
@@ -97,12 +149,14 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "SET @slave_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
     ];
 
+    // let pool_opts = PoolOpts::new().with_constraints(PoolConstraints::new(1, 1).unwrap()).with_reset_connection(false);
     let opts = OptsBuilder::default()
         .ip_or_hostname("localhost")
         .user(Some("root"))
         .pass(Some("baikai#1234"))
         // .max_allowed_packet(Some(67108864))
         .tcp_port(3306)
+        // .pool_opts(pool_opts)
         .init(init);
 
     let pool = Pool::new(opts);
@@ -111,7 +165,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let log_file_name = "mysql-bin.000002".to_owned();
     let log_file_pos: u64 = 126;
-    let server_id: u32 = 3000;
+    let server_id: u32 = 4000;
 
     {
         let strings: Option<String> = conn
@@ -132,3 +186,48 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 // mysql-8.0.43/plugin/semisync/semisync_replica_plugin.cc:: repl_semi_slave_request_dump
 // mariadb-10.3.39/sql/semisync_slave.cc:: request_transmit
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+    use mysql_async::{BinlogStreamRequest, OptsBuilder, Pool};
+    use tokio::select;
+
+    #[tokio::test]
+    async fn test() {
+        let init = vec![
+            "SET @rpl_semi_sync_replica = 1",
+            "SET @rpl_semi_sync_slave = 1",
+            // "SET @server_id=3000",
+            "SET @replica_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
+            "SET @slave_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
+        ];
+
+        let opts = OptsBuilder::default()
+            .ip_or_hostname("localhost")
+            .user(Some("root"))
+            .pass(Some("baikai#1234"))
+            // .max_allowed_packet(Some(67108864))
+            .tcp_port(3306)
+            .init(init);
+
+        let pool = Pool::new(opts);
+        let conn = pool.get_conn().await.unwrap();
+        let request = BinlogStreamRequest::new(4000)
+            .with_filename(b"mysql-bin.000007")
+            .with_pos(4);
+
+        let mut stream = conn.get_binlog_stream(request).await.unwrap();
+
+        loop {
+            select! {
+                Some(event) = stream.next() => {
+                    println!("{:?}", event);
+                },
+                // else => {
+
+                // }
+            }
+        }
+    }
+}

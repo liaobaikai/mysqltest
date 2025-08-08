@@ -51,3 +51,48 @@ impl super::Conn {
     }
 
 }
+
+
+./mysql_async-0.36.1/src/conn/binlog_stream/mod.rs
+
+pub struct BinlogStream {
+    read_packet: ReadPacket<'static, 'static>,
+    esr: EventStreamReader,
+    // TODO: Use 'static reader here (requires impl on the mysql_common side).
+    /// Uncompressed Transaction_payload_event we are iterating over (if any).
+    tpe: Option<Cursor<Vec<u8>>>,
+
+    semi_sync: bool,
+    need_reply: bool
+}
+
+impl BinlogStream {
+    /// `conn` is a `Conn` with `request_binlog` executed on it.
+    pub(super) fn new(conn: Conn) -> Self {
+        BinlogStream {
+            read_packet: ReadPacket::new(conn),
+            esr: EventStreamReader::new(Version4),
+            tpe: None,
+            semi_sync: false,   <<<<
+            need_reply: false,
+        }
+    }
+
+127+++++
+
+pub fn get_conn_mut(&mut self) -> &mut Conn {
+        self.read_packet.conn_mut()
+    }
+
+pub fn get_semi_sync_status(&self) -> (bool, bool) {
+        (self.semi_sync, self.need_reply)
+    }
+
+
+./mysql_async-0.36.1/src/io/read_packet.rs
+35+++
+
+#[cfg(feature = "binlog")]
+    pub(crate) fn conn_mut(&mut self) -> &mut crate::Conn {
+        self.0.as_mut()
+    }
