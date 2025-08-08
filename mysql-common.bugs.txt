@@ -1,5 +1,5 @@
-.\mysql_common-0.35.5\src\proto\codec\mod.rs#527
-
+.\mysql_common-0.35.5\src\proto\codec\mod.rs#
+527->UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
 if self.seq_id != chunk_info.seq_id() {
                     match comp_seq_id {
                         Some(seq_id) if seq_id == chunk_info.seq_id() => {
@@ -15,27 +15,6 @@ if self.seq_id != chunk_info.seq_id() {
                     }
                 }
 
-.\mysql_async-0.36.1\src\conn\binlog_stream\mod.rs#161
-
-if first_byte == Some(0) {
-    ++++++
-            println!("packet: {:?}", packet);      
-            let mut event_data = &packet[1..];
-            if event_data[0] == 0xef {
-                println!("slave semi-sync enabled");
-                if event_data[1] == 1 {
-                    println!("slave semi-sync status on");
-                } else {
-                    println!("slave semi-sync status off");
-                }
-                event_data = &packet[3..];
-            } else {
-                println!("slave semi-sync disabled");
-            }
-            // let event_data = &packet[1..];
-    +++++++         
-            match self.esr.read(event_data) {
-                Ok(Some(event)) => {
 
 
 
@@ -43,14 +22,13 @@ if first_byte == Some(0) {
 
 impl super::Conn {
 
-// 响应ack
+64++++++++++++++++++++++++++++++++++
+    // reply_ack
     pub async fn reply_ack(&mut self, position: u64, filename: &[u8]) -> Result<()> {
         let packet = SemiSyncAckPacket::new(position, filename);
-        self.write_struct(&packet).await?;
-        Ok(())
+        self.write_command(&packet).await
     }
 
-}
 
 
 ./mysql_async-0.36.1/src/conn/binlog_stream/mod.rs
@@ -61,38 +39,64 @@ pub struct BinlogStream {
     // TODO: Use 'static reader here (requires impl on the mysql_common side).
     /// Uncompressed Transaction_payload_event we are iterating over (if any).
     tpe: Option<Cursor<Vec<u8>>>,
-
-    semi_sync: bool,
-    need_reply: bool
+80++++++++++++++++++++++++++++++++++
+    sync_flag: bool,
+    need_reply: bool,
 }
 
 impl BinlogStream {
     /// `conn` is a `Conn` with `request_binlog` executed on it.
-    pub(super) fn new(conn: Conn) -> Self {
+    pub(super) fn new(conn: Conn, filename: String) -> Self {
         BinlogStream {
             read_packet: ReadPacket::new(conn),
             esr: EventStreamReader::new(Version4),
             tpe: None,
-            semi_sync: false,   <<<<
+91++++++++++++++++++++++++++++++++++
+            semi_sync: false,
             need_reply: false,
         }
     }
 
-127+++++
 
-pub fn get_conn_mut(&mut self) -> &mut Conn {
+123++++++++++++++++++++++++++++++++++
+
+    pub fn get_conn_mut(&mut self) -> &mut Conn {
         self.read_packet.conn_mut()
     }
 
-pub fn get_semi_sync_status(&self) -> (bool, bool) {
+    pub fn get_semi_sync_status(&self) -> (bool, bool) {
         (self.semi_sync, self.need_reply)
     }
 
 
-./mysql_async-0.36.1/src/io/read_packet.rs
-35+++
 
-#[cfg(feature = "binlog")]
+.\mysql_async-0.36.1\src\conn\binlog_stream\mod.rs#161
+
+179->UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
+if first_byte == Some(0) {
+            // println!("packet: {:?}", packet);
+            let mut event_data = &packet[1..];
+            self.semi_sync = event_data[0] == 0xef;
+            if event_data[0] == 0xef {
+                println!("Slave semi-sync enabled");
+                self.need_reply = event_data[1] == 1;
+                if event_data[1] == 1 {
+                    println!("Slave semi-sync status on");
+                } else {
+                    println!("Slave semi-sync status off");
+                }
+                event_data = &packet[3..];
+            } else {
+                println!("Slave semi-sync disabled");
+            }
+            
+            match self.esr.read(event_data) {
+
+
+./mysql_async-0.36.1/src/io/read_packet.rs
+35++++++++++++++++++++++++++++++++++
+
+    #[cfg(feature = "binlog")]
     pub(crate) fn conn_mut(&mut self) -> &mut crate::Conn {
         self.0.as_mut()
     }
