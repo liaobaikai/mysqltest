@@ -3,18 +3,32 @@
 // SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1
 // @master_binlog_checksum：MySQL在5.6版本之后为binlog引入了checksum机制，从库需要与主库相关参数保持一致。
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use futures_util::StreamExt;
 use mysql_async::{
     BinlogStreamRequest, Conn, OptsBuilder, Pool, binlog::events::EventData, prelude::Queryable,
 };
-use tokio::time::timeout;
+use mysql_common::binlog::BinlogFileHeader;
+use tokio::{
+    fs::{create_dir_all, OpenOptions},
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
+};
+mod binlog;
 
 // pub const REPLY_MAGIC_NUM_OFFSET: usize = 0;
 // pub const K_PACKET_MAGIC_NUM: u8 = 0xef;
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 // pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
+
+// const BINLOG_HEADER: [u8; 4] = BinlogFileHeader::VALUE; // "fe bin"
+
+// Hacky way to cut start [0 0 0 ...]
+fn strip_prefix(raw: &[u8]) -> &[u8] {
+    let pos = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
+    &raw[pos..]
+}
 
 async fn pull_binlog_events(
     conn: Conn,
@@ -22,11 +36,30 @@ async fn pull_binlog_events(
     mut log_file_name: String,
     server_id: u32,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let local_binlog_path = "./logs/";
+    create_dir_all(local_binlog_path).await?;
+
     let request = BinlogStreamRequest::new(server_id)
         .with_filename(log_file_name.as_bytes())
-        .with_pos(log_file_pos);
+        .with_pos(log_file_pos)
+        .with_port(8527)
+        .with_user("mysqltest".as_bytes())
+        .with_hostname("192.168.101.123".as_bytes());
+
     let mut events_num = 0;
     let mut binlog_stream = conn.get_binlog_stream(request).await?;
+
+    let mut binlog_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(Path::new(&local_binlog_path).join(&log_file_name))
+        .await?;
+    // if binlog_file.metadata().await.unwrap().len() == 0 {
+        // maybe using old file.
+    binlog_file.write_all(&BinlogFileHeader::VALUE).await?;
+    // }
 
     while let Some(event) = binlog_stream.next().await {
         let event = event.unwrap();
@@ -48,18 +81,33 @@ async fn pull_binlog_events(
                 // start with first event, but after is 0
                 // 157 00, 00, 00, 00, 00, 00, 00, 62, 69, 6e, 6c, 6f, 67, 2e, 30, 30, 30, 30, 30, 31
                 println!("ROTATE_EVENT::raw:: {:?}", event.data());
-                let filename_raw = &event.data()[1..];
-                let filename_pos = filename_raw
-                    .iter()
-                    .position(|&b| b != 0)
-                    .unwrap_or(filename_raw.len());
-                log_file_name = String::from_utf8_lossy(&filename_raw[filename_pos..]).to_string();
-                println!("ROTATE_EVENT::log_file_name:: {:?}", log_file_name);
+                let log_file_name_ =
+                    String::from_utf8_lossy(strip_prefix(&event.data()[1..])).to_string();
+                println!("ROTATE_EVENT::log_file_name:: {:?}", log_file_name_);
+
+                // if log_file_name != log_file_name_ {
+                //     binlog_file.flush().await?;
+                //     binlog_file.sync_all().await?;
+
+                    // new binlog file
+                    binlog_file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .open(Path::new(&local_binlog_path).join(&log_file_name_))
+                        .await?;
+                    binlog_file.set_len(0).await?;
+                    binlog_file.write_all(&BinlogFileHeader::VALUE).await?;
+
+                    log_file_name = log_file_name_;
+
+                // }
+                
             }
             _ => {}
         }
 
-        // if rpl_semi_sync_master_enabled {
         let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
         if semi_sync && need_ack {
             log_file_pos = event.header().log_pos() as u64;
@@ -73,13 +121,12 @@ async fn pull_binlog_events(
                 .await
                 .unwrap();
         }
-        // }
 
-        println!("event: {:?}", event);
+        binlog_file.write_all(&event.data()).await?;
+
         // let mut conn_ = conn.lock().await;
         // conn.reply_ack(log_file_pos, log_file_name.as_bytes());
         // send_ack(&mut conn, log_file_pos, log_file_name.as_bytes()).await;
-
         // iterate over rows of an event
         if let EventData::RowsEvent(re) = event.read_data()?.unwrap() {
             let tme = binlog_stream.get_tme(re.table_id());
@@ -88,10 +135,9 @@ async fn pull_binlog_events(
             }
         }
     }
-    // binlog_stream
-    //     .reply_ack(log_file_pos, log_file_name.as_bytes())
-    //     .await
-    //     .unwrap();
+
+    binlog_file.flush().await?;
+    binlog_file.sync_all().await?;
 
     // let (tx, _rx) = mpsc::unbounded_channel::<Event>();
     // let mut rx = UnboundedReceiverStream::new(_rx);
@@ -146,7 +192,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let init = vec![
         "SET @rpl_semi_sync_replica = 1",
         "SET @rpl_semi_sync_slave = 1",
-        // "SET @server_id=3000",
         "SET @replica_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
         "SET @slave_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
     ];
@@ -167,7 +212,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let log_file_name = "binlog.000001".to_owned();
     let log_file_pos: u64 = 157;
-    let server_id: u32 = 4000;
+    let server_id: u32 = 5000;
     {
         let strings: Option<String> = conn
             .query_first("select @@rpl_semi_sync_master_enabled")
