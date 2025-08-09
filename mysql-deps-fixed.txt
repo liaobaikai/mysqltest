@@ -74,20 +74,11 @@ impl BinlogStream {
 
 179->UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
 if first_byte == Some(0) {
-            // println!("packet: {:?}", packet);
             let mut event_data = &packet[1..];
             self.semi_sync = event_data[0] == 0xef;
             if event_data[0] == 0xef {
-                println!("Slave semi-sync enabled");
-                self.need_reply = event_data[1] == 1;
-                if event_data[1] == 1 {
-                    println!("Slave semi-sync status on");
-                } else {
-                    println!("Slave semi-sync status off");
-                }
+                self.need_reply = event_data[1] == 0x01;
                 event_data = &packet[3..];
-            } else {
-                println!("Slave semi-sync disabled");
             }
             
             match self.esr.read(event_data) {

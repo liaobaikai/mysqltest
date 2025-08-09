@@ -5,8 +5,13 @@ edition = "2024"
 
 [dependencies]
 futures-util = "0.3.31"
+log = "0.4.27"
+log4rs = {version = "1.3.0", features=["all_components", "config_parsing", "toml_format"]}
 mysql_async = {version = "0.36.1", features = ["binlog"]}
 mysql_common = "0.35.5"
+regex = "1.11.1"
+serde = {version = "1.0.219", features = ["serde_derive"]}
 tokio = {version = "1.47.1", features = ["full"]}
 tokio-stream = "0.1.17"
+toml = "0.9.5"
 uuid = {version = "1.17.0", features = ["v4"]}

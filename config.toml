@@ -1,0 +1,16 @@
+[master]
+host = "localhost"
+user = "root"
+pass = "123456"
+port = 4406
+max_allowed_packet = 67108864
+# init_sql=[]
+
+[local]
+datadir = "./data"
+rpl_semi_sync_slave_enabled = 1
+# Options:
+# slave_id = 5000
+slave_uuid = "79a87595-66fe-42cd-b235-e686346fbfc0"
+register_slave_port = 8527
+register_slave_host = "mysql-avatar"

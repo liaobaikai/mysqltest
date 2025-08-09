@@ -1,0 +1,53 @@
+# https://docs.rs/log4rs/latest/log4rs/index.html
+
+refresh_rate = "5 seconds"
+
+[appenders.stdout]
+kind = "console"
+
+[appenders.stdout.encoder]
+pattern = "{d(%m %d %H:%M:%S%.3f)} {h({l:>5.5})} {({M}:{L}):20.20}: {m}{n}"
+
+[appenders.file]
+kind = "rolling_file"
+path = "./logs/mysqltest.log"
+
+[appenders.file.encoder]
+pattern = "{m}{n}"
+
+[appenders.file.policy.trigger]
+kind = "time"
+interval = "1 day"
+modulate = false
+max_random_delay = 0
+
+[appenders.file.policy.roller]
+kind = "fixed_window"
+pattern = "./logs/archive/access.{}.log"
+# 最大保存压缩文件数
+count = 999999
+# 压缩日志索引值起点
+base = 1
+
+[appenders.mysqltest]
+kind = "rolling_file"
+path = "./logs/mysqltest.log"
+
+[appenders.mysqltest.encoder]
+pattern = "{d(%m %d %H:%M:%S%.3f)} {l:>5.5} {({M}:{L}):20.20}: {m}{n}"
+
+[appenders.mysqltest.policy.trigger]
+kind = "time"
+interval = "1 day"
+modulate = false
+max_random_delay = 0
+
+[appenders.mysqltest.policy.roller]
+kind = "fixed_window"
+pattern = "./logs/archive/pmm.{}.log"
+count = 10
+base = 1
+
+[root]
+level = "trace"
+appenders = [ "file", "stdout" ]

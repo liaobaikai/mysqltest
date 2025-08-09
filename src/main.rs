@@ -5,8 +5,9 @@
 
 use std::{
     fs::{File, OpenOptions, create_dir_all},
-    io::Write,
+    io::{Read, Write},
     path::Path,
+    process::exit,
 };
 
 use futures_util::StreamExt;
@@ -14,11 +15,16 @@ use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool};
 use mysql_common::binlog::BinlogFileHeader;
 use uuid::Uuid;
 
-use crate::query::{master_server_id, master_server_uuid, rpl_semi_sync_master_enabled};
+use crate::{
+    prelude::{MyConfig, NAME},
+    query::{
+        is_mariadb, master_gtid_mode, master_server_id, master_server_uuid,
+        rpl_semi_sync_master_enabled, show_replicas,
+    },
+};
+mod prelude;
 mod query;
 
-const SYSVAR_DEFINED_SEMI_SYNC: &str = "SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1";
-const DEFAULT_RELAYLOG_PATH: &str = "./relaylog/";
 // pub const REPLY_MAGIC_NUM_OFFSET: usize = 0;
 // pub const K_PACKET_MAGIC_NUM: u8 = 0xef;
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
@@ -31,14 +37,17 @@ fn strip_prefix(raw: &[u8]) -> &[u8] {
 }
 
 // 创建一个新的relaylog文件
-fn new_relaylog_file(filename: &str) -> std::result::Result<File, Box<dyn std::error::Error>> {
-    create_dir_all(DEFAULT_RELAYLOG_PATH)?;
+fn new_relaylog_file(
+    datadir: &str,
+    filename: &str,
+) -> std::result::Result<File, Box<dyn std::error::Error>> {
+    create_dir_all(datadir)?;
     let mut relaylog_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(Path::new(&DEFAULT_RELAYLOG_PATH).join(&filename))?;
+        .open(Path::new(datadir).join(&filename))?;
     relaylog_file.write_all(&BinlogFileHeader::VALUE)?;
 
     Ok(relaylog_file)
@@ -46,27 +55,23 @@ fn new_relaylog_file(filename: &str) -> std::result::Result<File, Box<dyn std::e
 
 async fn pull_binlog_events(
     conn: Conn,
-    mut log_file_pos: u64,
     mut log_file_name: String,
-    server_id: u32,
+    request: BinlogStreamRequest<'_>,
+    datadir: String,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let request = BinlogStreamRequest::new(server_id)
-        .with_filename(log_file_name.as_bytes())
-        .with_pos(log_file_pos)
-        .with_port(8527)
-        .with_user("mysqltest".as_bytes())
-        .with_hostname("192.168.101.123".as_bytes());
-
     // let mut events_num = 0;
     let mut binlog_stream = conn.get_binlog_stream(request).await?;
 
     // New file on start, when file exists truncated it.
-    let mut relaylog_file = new_relaylog_file(&log_file_name)?;
+    let mut relaylog_file = new_relaylog_file(&datadir, &log_file_name)?;
+    let mut log_file_pos;
 
     while let Some(event) = binlog_stream.next().await {
         let event = event?;
         log_file_pos = event.header().log_pos() as u64;
         // println!("event: {:?}", event);
+        log::debug!("{:?}", event);
+        log::debug!("Event checksum: {:?}", event.checksum());
         // events_num += 1;
         // assert that event type is known
         let event_type = event.header().event_type()?;
@@ -82,162 +87,233 @@ async fn pull_binlog_events(
                 // start with first event, but after is 0
                 // 157 00, 00, 00, 00, 00, 00, 00, 62, 69, 6e, 6c, 6f, 67, 2e, 30, 30, 30, 30, 30, 31
                 // println!("ROTATE_EVENT::raw:: {:?}", event.data());
-                let log_file_name_ =
-                    String::from_utf8_lossy(strip_prefix(&event.data()[1..])).to_string();
-                // println!("ROTATE_EVENT::log_file_name:: {:?}", log_file_name_);
+                log::debug!("Event data: {:?}", event.data());
+                let data = &event.data()[1..];
+                let len = if event.checksum().is_none() {
+                    // event.data 最后4位校验码
+                    data.len() - 4
+                } else {
+                    data.len()
+                };
+
+                log_file_name = String::from_utf8_lossy(strip_prefix(&data[0..len])).to_string();
 
                 relaylog_file.flush()?;
                 relaylog_file.sync_all()?;
 
                 // new binlog file
-                relaylog_file = new_relaylog_file(&log_file_name_)?;
-                println!("Switch log {} to {}", log_file_name, log_file_name_);
-                log_file_name = log_file_name_;
+                relaylog_file = new_relaylog_file(&datadir, &log_file_name)?;
+
+                // Remarks:
+                // Mariadb 切换日志可能会收到两次ROTATE_EVENT事件，测试版本 10.3.39
+                log::info!("Rotated log to {}", log_file_name);
+                // 对比了原生的binlog，不需要将ROTATE_EVENT写入binlog中。
+                continue;
             }
             _ => {}
         }
 
         let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
-        if semi_sync && need_ack {
-            match binlog_stream
-                .get_conn_mut()
-                .reply_ack(log_file_pos, log_file_name.as_bytes())
-                .await
-            {
-                Ok(()) => println!("Ack {} {} replied", log_file_name, log_file_pos),
-                Err(e) => println!("Ack {} {} reply failed, {e}", log_file_name, log_file_pos),
+        if semi_sync {
+            log::info!(
+                "Slave semi-sync status {}",
+                if need_ack { "on" } else { "off" }
+            );
+            if need_ack {
+                match binlog_stream
+                    .get_conn_mut()
+                    .reply_ack(log_file_pos, log_file_name.as_bytes())
+                    .await
+                {
+                    Ok(()) => log::info!("Ack {} {} replied", log_file_name, log_file_pos),
+                    Err(e) => {
+                        log::error!("Ack {} {} reply failed, {e}", log_file_name, log_file_pos)
+                    }
+                }
             }
         }
 
         // Write event,
         match event.write(mysql_async::binlog::BinlogVersion::Version4, &relaylog_file) {
-            Ok(()) => println!("Data {} {} recorded", log_file_name, log_file_pos),
-            Err(e) => println!("Event write failed: {e}"),
+            Ok(()) => log::info!("Event {} {} recorded", log_file_name, log_file_pos),
+            Err(e) => log::error!("Event record failed: {e}"),
+        }
+
+        // Exit only event catch up.
+        if let Ok(_f) = File::open(Path::new(&datadir).join("bye")) {
+            break;
         }
     }
 
     relaylog_file.flush()?;
     relaylog_file.sync_all()?;
 
-    // let (tx, _rx) = mpsc::unbounded_channel::<Event>();
-    // let mut rx = UnboundedReceiverStream::new(_rx);
-    // println!("conn: {:?}", binlog_stream.get_conn_mut());
-    // loop {
-    //     println!("aaaa");
-
-    //     select! {
-    //         Some(ret) = binlog_stream.next() => {
-    //             println!("{:?}", ret);
-    //             let event = match ret {
-    //                 Ok(evt) => evt,
-    //                 Err(e) => {
-    //                     return Err(Box::new(e));
-    //                 }
-    //             };
-
-    //             if let Err(e) = tx.send(event) {
-    //                 return Err(Box::new(e));
-    //             }
-    //         },
-    //         Some(event) = rx.next() => {
-    //             println!("pos: {}", event.header().log_pos());
-    //             println!("event: {:?}", event);
-
-    //             // send_semi_sync_ack(&mut conn_, event.header().log_pos() as u64).await?;
-
-    //             // binlog_stream.reply_ack(event.header().log_pos() as u64, "mysql-bin.000007".to_owned()).await;
-    //             // conn.query_drop("show databases").await;
-    //             let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
-    //             if semi_sync && need_ack {
-    //                 binlog_stream.get_conn_mut().reply_ack(event.header().log_pos() as u64, "mysql-bin.000008".to_string()).await.unwrap();
-    //             }
-    //         }
-    //         // else => {
-
-    //         // }
-    //     }
-    // }
-
-    // assert!(events_num > 0);
-    // timeout(Duration::from_secs(10), binlog_stream.close())
-    //     .await
-    //     .unwrap()
-    //     .unwrap();
     println!("bye.");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // 没有指定UUID，那就自己生成一个
-    let id = Uuid::new_v4();
-    let slave_uuid = id.to_string();
-    let init = vec![
-        SYSVAR_DEFINED_SEMI_SYNC.to_owned(),
+    log4rs::init_file("./log4rs.toml", Default::default())?;
+
+    let config_path = "./config.toml";
+    let mut config_file = match File::open(config_path) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Config file {} open failed, {e}", config_path);
+            exit(1);
+        }
+    };
+
+    let mut buf = String::new();
+    config_file.read_to_string(&mut buf)?;
+
+    let config: MyConfig = toml::from_str(&buf)?;
+
+    // let build_time = match option_env!("BUILD_TIME") {
+    //     Some(k) => format!(" on {}", k),
+    //     None => String::new(),
+    // };
+
+    // mysql avatar
+    let slave_uuid = match config.local.slave_uuid {
+        Some(id) => id,
+        None => {
+            // 没有指定UUID，那就自己生成一个
+            Uuid::new_v4().to_string()
+        }
+    };
+
+    // 是否启动半同步复制
+    let rpl_semi_sync_slave_enabled = config.local.rpl_semi_sync_slave_enabled.unwrap_or_default();
+    let mut init = vec![
+        format!(
+            "SET @rpl_semi_sync_replica = {}, @rpl_semi_sync_slave = {}",
+            rpl_semi_sync_slave_enabled, rpl_semi_sync_slave_enabled
+        ),
         format!(
             "SET @replica_uuid = '{}', @slave_uuid = '{}'",
             slave_uuid, slave_uuid
         ),
     ];
 
+    // 可以指定初始化sql
+    if let Some(mut init_sqls) = config.master.init_sql {
+        init.append(&mut init_sqls);
+    }
+
     let opts = OptsBuilder::default()
-        .ip_or_hostname("localhost")
-        .user(Some("root"))
-        .pass(Some("123456"))
-        // .max_allowed_packet(Some(67108864))
-        .tcp_port(3312)
+        .ip_or_hostname(config.master.host)
+        .user(config.master.user)
+        .pass(config.master.pass)
+        .max_allowed_packet(config.master.max_allowed_packet)
+        .tcp_port(config.master.port.unwrap_or(3306))
         .init(init);
 
     let pool = Pool::new(opts);
     let mut conn = pool.get_conn().await?;
-    print!(
-        "Connected to MySQL Server {}:{}, process id {}",
+    log::debug!("{:?}", conn);
+    let (v1, v2, v3) = conn.server_version();
+    let is_maria = is_mariadb(&mut conn).await?;
+    log::info!(
+        "Connected to {} Server {}:{}, process id {}, version {}.{}.{}",
+        if is_maria { "MariaDB" } else { "MySQL" },
         conn.opts().ip_or_hostname(),
         conn.opts().tcp_port(),
-        conn.id()
+        conn.id(),
+        v1,
+        v2,
+        v3
     );
 
-    let log_file_name = "binlog.000001".to_owned();
-    let log_file_pos: u64 = 157;
-    let server_id: u32 = 5000;
-    {
-        let (v1, v2, v3) = conn.server_version();
-        println!(", version {}.{}.{}", v1, v2, v3);
+    let master_server_id = master_server_id(&mut conn).await?;
+    log::info!("Server_id={}", master_server_id);
+
+    let log_file_name = "mysql-bin.000001".to_owned();
+    let log_file_pos: u64 = 4;
+
+    let reg_host = config
+        .local
+        .register_slave_host
+        .unwrap_or(format!("{}-avatar", NAME));
+
+    let reg_port = config.local.register_slave_port.unwrap_or(8527);
+
+    let slave_id = match config.local.slave_id {
+        Some(v) => v,
+        None => {
+            let mut server_ids = Vec::new();
+            server_ids.push(master_server_id);
+            let mut id = 0;
+            for slave in show_replicas(&mut conn).await? {
+                if slave.host() == Some(reg_host.clone()) && slave.port() == reg_port {
+                    id = slave.server_id();
+                    break;
+                }
+                server_ids.push(slave.server_id());
+            }
+            let max = server_ids.iter().max().unwrap_or(&master_server_id);
+            // 需要考虑重启，不然会出现很多线程连接上去
+            if id > 0 { id } else { *max + 1 }
+        }
+    };
+
+    log::info!("Slave_id={}", slave_id);
+    let master_server_uuid = match master_server_uuid(&mut conn).await {
+        Ok(v) => v.unwrap_or_default(),
+        Err(e) => {
+            log::warn!("{e}");
+            String::new()
+        }
+    };
+
+    log::info!("Server_uuid={}", master_server_uuid);
+    log::info!("Slave_uuid={}", slave_uuid);
+
+    let rpl_semi_sync_master_enabled = match rpl_semi_sync_master_enabled(&mut conn).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("{e}");
+            0
+        }
+    };
+    log::info!(
+        "Rpl_semi_sync_master_enabled={}",
+        rpl_semi_sync_master_enabled
+    );
+    log::info!(
+        "Rpl_semi_sync_slave_enabled={}",
+        rpl_semi_sync_slave_enabled
+    );
+
+    let gtid_mode = match master_gtid_mode(&mut conn).await {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("{e}");
+            false
+        }
+    };
+    log::info!("Gtid_mode={}", gtid_mode);
+
+    match conn.opts().max_allowed_packet() {
+        Some(max_allowed_packet) => {
+            log::info!("Max_allowed_packet={}", max_allowed_packet)
+        }
+        None => {
+            log::info!("Max_allowed_packet=<default>")
+        }
     }
 
-    println!(
-        "Master:: var:: server_id={}",
-        master_server_id(&mut conn).await?
-    );
-    println!(
-        "Master:: var:: server_uuid={}",
-        master_server_uuid(&mut conn).await?.unwrap_or_default()
-    );
-    println!(
-        "Master:: var:: rpl_semi_sync_master_enabled={}",
-        rpl_semi_sync_master_enabled(&mut conn).await?
-    );
-    println!(
-        "Master:: opt:: max_allowed_packet={:?}",
-        conn.opts().max_allowed_packet()
-    );
-    println!("Master:: opt:: db_name={:?}", conn.opts().db_name());
-    println!("Master:: opt:: compression={:?}", conn.opts().compression());
-    println!(
-        "Master:: opt:: stmt_cache_size={:?}",
-        conn.opts().stmt_cache_size()
-    );
-    println!(
-        "Master:: opt:: tcp_keepalive={:?}",
-        conn.opts().tcp_keepalive()
-    );
-    println!("Master:: opt:: tcp_nodelay={:?}", conn.opts().tcp_nodelay());
-    println!(
-        "Master:: opt:: wait_timeout={:?}",
-        conn.opts().wait_timeout()
-    );
+    let cloned_log_file_name = log_file_name.clone();
 
-    pull_binlog_events(conn, log_file_pos, log_file_name, server_id).await?;
+    let request = BinlogStreamRequest::new(slave_id)
+        .with_filename(cloned_log_file_name.as_bytes())
+        .with_pos(log_file_pos)
+        .with_port(reg_port)
+        .with_user(NAME.as_bytes())
+        .with_hostname(reg_host.as_bytes());
+
+    pull_binlog_events(conn, log_file_name, request, config.local.datadir).await?;
 
     Ok(())
 }
