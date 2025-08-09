@@ -24,7 +24,6 @@ const DEFAULT_RELAYLOG_PATH: &str = "./relaylog/";
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 // pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
-
 // Hacky way to cut start [0 0 0 ...]
 fn strip_prefix(raw: &[u8]) -> &[u8] {
     let pos = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
@@ -82,20 +81,17 @@ async fn pull_binlog_events(
                 // | common_header | post_header | position of the first event | file name |
                 // start with first event, but after is 0
                 // 157 00, 00, 00, 00, 00, 00, 00, 62, 69, 6e, 6c, 6f, 67, 2e, 30, 30, 30, 30, 30, 31
-                println!("ROTATE_EVENT::raw:: {:?}", event.data());
+                // println!("ROTATE_EVENT::raw:: {:?}", event.data());
                 let log_file_name_ =
                     String::from_utf8_lossy(strip_prefix(&event.data()[1..])).to_string();
-                println!("ROTATE_EVENT::log_file_name:: {:?}", log_file_name_);
+                // println!("ROTATE_EVENT::log_file_name:: {:?}", log_file_name_);
 
                 relaylog_file.flush()?;
                 relaylog_file.sync_all()?;
 
                 // new binlog file
                 relaylog_file = new_relaylog_file(&log_file_name_)?;
-                println!(
-                    "Switch relaylog file: {} -> {}",
-                    log_file_name, log_file_name_
-                );
+                println!("Switch log {} to {}", log_file_name, log_file_name_);
                 log_file_name = log_file_name_;
             }
             _ => {}
@@ -103,26 +99,21 @@ async fn pull_binlog_events(
 
         let (semi_sync, need_ack) = binlog_stream.get_semi_sync_status();
         if semi_sync && need_ack {
-            binlog_stream
+            match binlog_stream
                 .get_conn_mut()
                 .reply_ack(log_file_pos, log_file_name.as_bytes())
-                .await?;
-            println!("Ack {} {} replied", log_file_name, log_file_pos);
+                .await
+            {
+                Ok(()) => println!("Ack {} {} replied", log_file_name, log_file_pos),
+                Err(e) => println!("Ack {} {} reply failed, {e}", log_file_name, log_file_pos),
+            }
         }
 
-        println!("Data {} {} recorded", log_file_name, log_file_pos);
-        event.write(mysql_async::binlog::BinlogVersion::Version4, &relaylog_file)?;
-
-        // let mut conn_ = conn.lock().await;
-        // conn.reply_ack(log_file_pos, log_file_name.as_bytes());
-        // send_ack(&mut conn, log_file_pos, log_file_name.as_bytes()).await;
-        // iterate over rows of an event
-        // if let EventData::RowsEvent(re) = event.read_data()?.unwrap() {
-        //     let tme = binlog_stream.get_tme(re.table_id());
-        //     for row in re.rows(tme.unwrap()) {
-        //         row.unwrap();
-        //     }
-        // }
+        // Write event,
+        match event.write(mysql_async::binlog::BinlogVersion::Version4, &relaylog_file) {
+            Ok(()) => println!("Data {} {} recorded", log_file_name, log_file_pos),
+            Err(e) => println!("Event write failed: {e}"),
+        }
     }
 
     relaylog_file.flush()?;
