@@ -13,6 +13,7 @@ pub struct Replica {
 }
 
 impl Replica {
+    #[allow(unused)]
     pub(crate) fn server_id(&self) -> u64 {
         self.server_id
     }
@@ -21,6 +22,7 @@ impl Replica {
 // Query:
 // Old Version: show slave hosts
 // New Version: show replicas
+#[allow(unused)]
 pub async fn show_replicas(conn: &mut Conn) -> std::result::Result<Vec<Replica>, Box<dyn std::error::Error>> {
     let replicas = match conn.query("show replicas").await {
         Ok(replicas) => replicas,

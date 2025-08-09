@@ -1,6 +1,0 @@
-
-
-
-pub(crate) struct BinlogFileWriter {
-    
-}

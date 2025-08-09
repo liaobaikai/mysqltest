@@ -9,3 +9,4 @@ mysql_async = {version = "0.36.1", features = ["binlog"]}
 mysql_common = "0.35.5"
 tokio = {version = "1.47.1", features = ["full"]}
 tokio-stream = "0.1.17"
+uuid = {version = "1.17.0", features = ["v4"]}

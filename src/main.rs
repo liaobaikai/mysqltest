@@ -12,9 +12,9 @@ use std::{
 use futures_util::StreamExt;
 use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool};
 use mysql_common::binlog::BinlogFileHeader;
+use uuid::Uuid;
 
 use crate::query::{master_server_id, master_server_uuid, rpl_semi_sync_master_enabled};
-mod binlog;
 mod query;
 
 const SYSVAR_DEFINED_SEMI_SYNC: &str = "SET @rpl_semi_sync_replica = 1, @rpl_semi_sync_slave = 1";
@@ -24,7 +24,6 @@ const DEFAULT_RELAYLOG_PATH: &str = "./relaylog/";
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 // pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
-// const BINLOG_HEADER: [u8; 4] = BinlogFileHeader::VALUE; // "fe bin"
 
 // Hacky way to cut start [0 0 0 ...]
 fn strip_prefix(raw: &[u8]) -> &[u8] {
@@ -179,24 +178,27 @@ async fn pull_binlog_events(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // 没有指定UUID，那就自己生成一个
+    let id = Uuid::new_v4();
+    let slave_uuid = id.to_string();
     let init = vec![
-        SYSVAR_DEFINED_SEMI_SYNC,
-        "SET @replica_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005', @slave_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
+        SYSVAR_DEFINED_SEMI_SYNC.to_owned(),
+        format!(
+            "SET @replica_uuid = '{}', @slave_uuid = '{}'",
+            slave_uuid, slave_uuid
+        ),
     ];
 
-    // let pool_opts = PoolOpts::new().with_constraints(PoolConstraints::new(1, 1).unwrap()).with_reset_connection(false);
     let opts = OptsBuilder::default()
         .ip_or_hostname("localhost")
         .user(Some("root"))
         .pass(Some("123456"))
         // .max_allowed_packet(Some(67108864))
         .tcp_port(3312)
-        // .pool_opts(pool_opts)
         .init(init);
 
     let pool = Pool::new(opts);
     let mut conn = pool.get_conn().await?;
-    // println!("conn: {:?}", conn);
     print!(
         "Connected to MySQL Server {}:{}, process id {}",
         conn.opts().ip_or_hostname(),
@@ -243,16 +245,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         "Master:: opt:: wait_timeout={:?}",
         conn.opts().wait_timeout()
     );
-
-    //     assert_eq!(strings, Some("1".to_owned()));
-    // }
-
-    // calc server_id by server server_id
-
-    // tokio::spawn(async move {
-    //     conn.reply_ack(log_file_pos, log_file_name.as_bytes())
-    // });
-    // conn.reply_ack(log_file_pos, log_file_name.as_bytes()).await?;
 
     pull_binlog_events(conn, log_file_pos, log_file_name, server_id).await?;
 
