@@ -4,9 +4,9 @@
 // @master_binlog_checksum：MySQL在5.6版本之后为binlog引入了checksum机制，从库需要与主库相关参数保持一致。
 
 use std::{
-    fs::{File, OpenOptions, create_dir_all},
+    fs::{create_dir_all, File, OpenOptions},
     io::{Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::exit,
 };
 
@@ -39,6 +39,9 @@ fn strip_prefix(raw: &[u8]) -> &[u8] {
 }
 
 fn gen_relaylog_filename(relay_log_prefix: &str, filename: &str) -> String {
+    if relay_log_prefix == "" {
+        println!("xxxxxxxxxxxx")
+    }
     format!("{}_{}", relay_log_prefix, filename)
 }
 
@@ -58,14 +61,23 @@ fn new_relaylog_file(
     Ok(relaylog_file)
 }
 
+fn write_relaylog_index(relaylog_index_file: &PathBuf, newfile: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let mut index_file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open(&relaylog_index_file)?;
+    index_file.write_all(format!("{}\n", newfile).as_bytes())?;
+    index_file.flush()?;
+    Ok(())
+}
+
 async fn pull_binlog_events(
     conn: Conn,
     mut log_file_name: String,
     request: BinlogStreamRequest<'_>,
     config: &MyConfig,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    // let mut events_num = 0;
-    let mut binlog_stream = conn.get_binlog_stream(request).await?;
     let relay_log_basename = config.replica.relay_log_basename.clone().unwrap();
     create_dir_all(&relay_log_basename)?;
 
@@ -74,15 +86,17 @@ async fn pull_binlog_events(
     let relay_log_prefix = relay_log_prefix.to_string_lossy();
 
     // New file on start, when file exists truncated it.
-    let mut relaylog_file = new_relaylog_file(&relay_log_basename, &log_file_name)?;
+    let mut relaylog_file = new_relaylog_file(&relay_log_prefix, &log_file_name)?;
     let relaylog_index_file =
         Path::new(&relay_log_basename).join(&config.replica.relay_log_index.clone().unwrap());
     // let relaylog_index_file = relaylog_index_file.to_string_lossy();
 
     let mut relaylog_index_value = gen_relaylog_filename(&relay_log_prefix, &log_file_name);
+    write_relaylog_index(&relaylog_index_file, &relaylog_index_value)?;
 
     let mut log_file_pos;
 
+    let mut binlog_stream = conn.get_binlog_stream(request).await?;
     while let Some(event) = binlog_stream.next().await {
         let event = event?;
         log_file_pos = event.header().log_pos() as u64;
@@ -124,13 +138,7 @@ async fn pull_binlog_events(
                 let newfile = gen_relaylog_filename(&relay_log_prefix, &log_file_name);
                 if relaylog_index_value != newfile {
                     // 写 index 文件
-                    let mut index_file = OpenOptions::new()
-                        .write(true)
-                        .append(true)
-                        .create(true)
-                        .open(&relaylog_index_file)?;
-                    index_file.write_all(format!("{}\n", newfile).as_bytes())?;
-                    index_file.flush()?;
+                    write_relaylog_index(&relaylog_index_file, &relaylog_index_value)?;
                     relaylog_index_value = newfile;
                 }
 
@@ -265,7 +273,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    log::info!("Start_filename={}", log_file_name);
+    log::info!("Start_filename={:?}", log_file_name);
     let log_file_pos = match args.start_position {
         Some(v) => v,
         None => match config.mysql.start_position {
@@ -308,7 +316,17 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     }
 
     log::info!(
-        "Relay_log_basename={}",
+        "Replica_id={}",
+        match config.replica.replica_id.clone() {
+            Some(v) => format!("{}", v),
+            None => format!("<Not set>"),
+        }
+    );
+
+    log::info!("Replica_uuid={:?}", replica_uuid);
+
+    log::info!(
+        "Relay_log_basename={:?}",
         config.replica.relay_log_basename.clone().unwrap()
     );
 
@@ -316,12 +334,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.replica.relay_log = Some(String::from("relay-bin"))
     }
 
-    log::info!("Relay_log={}", config.replica.relay_log.clone().unwrap());
+    log::info!("Relay_log={:?}", config.replica.relay_log.clone().unwrap());
     if config.replica.relay_log_index.clone().is_none() {
         config.replica.relay_log_index = Some(String::from("relay-bin.index"))
     }
     log::info!(
-        "Relay_log_index={}",
+        "Relay_log_index={:?}",
         config.replica.relay_log_index.clone().unwrap()
     );
 
@@ -332,6 +350,11 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Some(v) => v,
             None => 0,
         }
+    );
+
+    log::info!(
+        "Rpl_semi_sync_replica_enabled={}",
+        rpl_semi_sync_replica_enabled
     );
 
     let mut init = vec![
@@ -381,14 +404,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     //     log::info!("Binlog_gtid_pos: {:?}", args.filename_or_gtid);
     // } else if args.with_file {
 
-    let gtid = binlog_gtid_pos(&mut conn, log_file_pos, log_file_name.as_bytes()).await?;
-    log::info!(
-        "Binlog_gtid_pos: {:?}",
-        match gtid {
-            Some(v) => v,
-            None => String::new(),
-        }
-    );
+    
     // } else {
     //     // Unknown
     // }
@@ -401,7 +417,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     let report_port = config.replica.report_port.unwrap_or(8527);
 
-    let slave_id = match config.replica.replica_id {
+    let replica_id = match config.replica.replica_id {
         Some(v) => v,
         None => {
             let mut server_ids = Vec::new();
@@ -416,11 +432,13 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             }
             let max = server_ids.iter().max().unwrap_or(&master_server_id);
             // 需要考虑重启，不然会出现很多线程连接上去
-            if id > 0 { id } else { *max + 1 }
+            let id = if id > 0 { id } else { *max + 1 };
+            log::info!("Automatically set Replica_id={}", id);
+            id
         }
     };
+    
 
-    log::info!("Slave_id={}", slave_id);
     let master_server_uuid = match master_server_uuid(&mut conn).await {
         Ok(v) => v.unwrap_or_default(),
         Err(e) => {
@@ -430,7 +448,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     };
 
     log::info!("Server_uuid={:?}", master_server_uuid);
-    log::info!("Replica_uuid={:?}", replica_uuid);
 
     let rpl_semi_sync_master_enabled = match rpl_semi_sync_master_enabled(&mut conn).await {
         Ok(v) => v,
@@ -442,10 +459,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     log::info!(
         "Rpl_semi_sync_master_enabled={}",
         rpl_semi_sync_master_enabled
-    );
-    log::info!(
-        "Rpl_semi_sync_replica_enabled={}",
-        rpl_semi_sync_replica_enabled
     );
 
     let gtid_mode = match master_gtid_mode(&mut conn).await {
@@ -461,20 +474,31 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "OFF"
         }
     };
-    log::info!("Gtid_mode={}", gtid_mode);
+    log::info!("Gtid_mode={:?}", gtid_mode);
+
+    let gtid = binlog_gtid_pos(&mut conn, log_file_pos, log_file_name.as_bytes()).await?;
+    log::info!(
+        "Binlog_gtid_pos={:?}, filename={:?}, position={}",
+        match gtid {
+            Some(v) => v,
+            None => String::new(),
+        },
+        log_file_name.clone(), 
+        log_file_pos
+    );
 
     match conn.opts().max_allowed_packet() {
         Some(max_allowed_packet) => {
             log::info!("Max_allowed_packet={}", max_allowed_packet)
         }
         None => {
-            log::info!("Max_allowed_packet=<default>")
+            log::info!("Max_allowed_packet=<Not set>")
         }
     }
 
     let cloned_log_file_name = log_file_name.clone();
 
-    let request = BinlogStreamRequest::new(slave_id)
+    let request = BinlogStreamRequest::new(replica_id)
         .with_filename(cloned_log_file_name.as_bytes())
         .with_pos(log_file_pos)
         .with_port(report_port)

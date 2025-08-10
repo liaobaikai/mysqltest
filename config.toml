@@ -29,6 +29,6 @@ relay_log_recovery = 1
 rpl_semi_sync_replica_enabled = 1
 # Unused.
 replica_max_allowed_packet = 1024
-replica_verify_checksum = 1
+replica_verify_checksum = 0
 # 
 skip_event = [ 0x04 ]

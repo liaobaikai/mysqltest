@@ -19,7 +19,7 @@
                     "kind": "bin"
                 }
             },
-            "args": [],
+            "args": ["--start-filename=mysql-bin.000002", "-j4"],
             "cwd": "${workspaceFolder}"
         },
         {
