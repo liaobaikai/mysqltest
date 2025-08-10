@@ -10,15 +10,17 @@ use std::{
     process::exit,
 };
 
+use byteorder::{ByteOrder, LittleEndian};
+use clap::Parser;
 use futures_util::StreamExt;
-use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool};
+use mysql_async::{binlog::BinlogChecksumAlg, BinlogStreamRequest, Conn, OptsBuilder, Pool};
 use mysql_common::binlog::BinlogFileHeader;
 use uuid::Uuid;
 
 use crate::{
-    prelude::{MyConfig, NAME},
+    prelude::{Args, MyConfig, NAME},
     query::{
-        is_mariadb, master_gtid_mode, master_server_id, master_server_uuid,
+        binlog_gtid_pos, is_mariadb, master_gtid_mode, master_server_id, master_server_uuid,
         rpl_semi_sync_master_enabled, show_replicas,
     },
 };
@@ -133,6 +135,26 @@ async fn pull_binlog_events(
             }
         }
 
+        // Checksum
+        if event.footer().get_checksum_enabled()  {
+            if let Some(event_checksum) = event.checksum() {
+                let calc_checksum = event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32);
+                if LittleEndian::read_u32(&event_checksum) == calc_checksum {
+                    log::info!("Event checksum {} {} verified", log_file_name, log_file_pos);
+                } else {
+                    // 考虑写到一个目录，以事件命名
+                    // format: {log_file_name}.{log_file_pos}.dump
+                    log::info!("Event checksum {} {} verification failed", log_file_name, log_file_pos);
+                    let dump_file = format!("{}.{}.dump", log_file_name, log_file_pos);
+                    let relaylog_file_dump = new_relaylog_file(&datadir, &dump_file)?;
+                    match event.write(mysql_async::binlog::BinlogVersion::Version4, &relaylog_file_dump) {
+                        Ok(()) => log::info!("Event {} {} dumped", dump_file, log_file_pos),
+                        Err(e) => log::error!("Event dump failed: {e}"),
+                    }
+                }
+            }
+        }
+
         // Write event,
         match event.write(mysql_async::binlog::BinlogVersion::Version4, &relaylog_file) {
             Ok(()) => log::info!("Event {} {} recorded", log_file_name, log_file_pos),
@@ -140,7 +162,9 @@ async fn pull_binlog_events(
         }
 
         // Exit only event catch up.
-        if let Ok(_f) = File::open(Path::new(&datadir).join("bye")) {
+        let bye_file = Path::new(&datadir).join("bye");
+        if let Ok(_f) = File::open(&bye_file) {
+            log::info!("The bye file {} exists", bye_file.display());
             break;
         }
     }
@@ -154,6 +178,8 @@ async fn pull_binlog_events(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
     log4rs::init_file("./log4rs.toml", Default::default())?;
 
     let config_path = "./config.toml";
@@ -169,6 +195,30 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     config_file.read_to_string(&mut buf)?;
 
     let config: MyConfig = toml::from_str(&buf)?;
+
+    let log_file_name = match args.start_filename {
+        Some(v) => v,
+        None => match config.master.start_filename {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                println!("Using --with-file, --start-filename is requred");
+                exit(1);
+            }
+        },
+    };
+
+    log::info!("Start_filename={}", log_file_name);
+    let log_file_pos = match args.start_position {
+        Some(v) => v,
+        None => match config.master.start_position {
+            Some(v) if v > 0 => v,
+            _ => {
+                println!("Using --with-file, --start-position is requred");
+                exit(1);
+            }
+        },
+    };
+    log::info!("Start_position={}", log_file_pos);
 
     // let build_time = match option_env!("BUILD_TIME") {
     //     Some(k) => format!(" on {}", k),
@@ -229,8 +279,21 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let master_server_id = master_server_id(&mut conn).await?;
     log::info!("Server_id={}", master_server_id);
 
-    let log_file_name = "mysql-bin.000001".to_owned();
-    let log_file_pos: u64 = 4;
+    // if args.with_gtid {
+    //     log::info!("Binlog_gtid_pos: {:?}", args.filename_or_gtid);
+    // } else if args.with_file {
+
+    let gtid = binlog_gtid_pos(&mut conn, log_file_pos, log_file_name.as_bytes()).await?;
+    log::info!(
+        "Binlog_gtid_pos: {:?}",
+        match gtid {
+            Some(v) => v,
+            None => String::new(),
+        }
+    );
+    // } else {
+    //     // Unknown
+    // }
 
     let reg_host = config
         .local
@@ -267,8 +330,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    log::info!("Server_uuid={}", master_server_uuid);
-    log::info!("Slave_uuid={}", slave_uuid);
+    log::info!("Server_uuid={:?}", master_server_uuid);
+    log::info!("Slave_uuid={:?}", slave_uuid);
 
     let rpl_semi_sync_master_enabled = match rpl_semi_sync_master_enabled(&mut conn).await {
         Ok(v) => v,
@@ -287,10 +350,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     );
 
     let gtid_mode = match master_gtid_mode(&mut conn).await {
-        Ok(v) => v,
+        Ok(v) => {
+            if v {
+                "ON"
+            } else {
+                "OFF"
+            }
+        }
         Err(e) => {
             log::warn!("{e}");
-            false
+            "OFF"
         }
     };
     log::info!("Gtid_mode={}", gtid_mode);
@@ -318,65 +387,43 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// mysql-8.0.43/plugin/semisync/semisync_replica_plugin.cc:: repl_semi_slave_request_dump
-// mariadb-10.3.39/sql/semisync_slave.cc:: request_transmit
-
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener};
 
-    use futures_util::StreamExt;
-    use mysql_async::{BinlogStreamRequest, OptsBuilder, Pool};
-    use tokio::select;
 
+    // 模拟一个mysqlserver，给slave发送binlog日志
     #[tokio::test]
-    async fn test() {
-        let init = vec![
-            "SET @rpl_semi_sync_replica = 1",
-            "SET @rpl_semi_sync_slave = 1",
-            // "SET @server_id=3000",
-            "SET @replica_uuid = 'ad501e78-7144-11f0-84cf-0242ac110005'",
-        ];
-
-        let opts = OptsBuilder::default()
-            .ip_or_hostname("localhost")
-            .user(Some("root"))
-            .pass(Some("baikai#1234"))
-            // .max_allowed_packet(Some(67108864))
-            .tcp_port(3306)
-            .init(init);
-
-        let pool = Pool::new(opts);
-        let conn = pool.get_conn().await.unwrap();
-        let request = BinlogStreamRequest::new(4000)
-            .with_filename(b"mysql-bin.000007")
-            .with_pos(4);
-
-        let mut stream = conn.get_binlog_stream(request).await.unwrap();
+    async fn test_mysql_server() -> Result<(), Box<dyn std::error::Error>> {
+        let listener = TcpListener::bind("127.0.0.1:8080").await?;
 
         loop {
-            select! {
-                Some(event) = stream.next() => {
-                    println!("{:?}", event);
-                },
-                // else => {
+            let (mut socket, _) = listener.accept().await?;
 
-                // }
-            }
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+
+                // In a loop, read data from the socket and write the data back.
+                loop {
+                    let n = match socket.read(&mut buf).await {
+                        // socket closed
+                        Ok(0) => return,
+                        Ok(n) => n,
+                        Err(e) => {
+                            eprintln!("failed to read from socket; err = {:?}", e);
+                            return;
+                        }
+                    };
+
+                    println!("data: {:?}", buf);
+
+                    // Write the data back
+                    if let Err(e) = socket.write_all(&buf[0..n]).await {
+                        eprintln!("failed to write to socket; err = {:?}", e);
+                        return;
+                    }
+                }
+            });
         }
-    }
-
-    #[test]
-    fn test2() {
-        let position: u64 = 2646;
-        let filename: String = "binlog.000001".to_owned();
-
-        let mut buf = Vec::new();
-        buf.write_all(&[0xef]).unwrap();
-        buf.write_all(&position.to_le_bytes()[..8]).unwrap();
-        buf.write_all(&filename.as_bytes()).unwrap();
-        buf.write_all(&[0x00]).unwrap();
-
-        println!("buf: {:02x?}", buf);
     }
 }

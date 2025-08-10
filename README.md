@@ -163,6 +163,71 @@ semi_sync ACK数据包说明：
 
 ```
 
+1、ack返回机制，（林总已验证通过）  
+   部分事件主库没有要求返回ack，ack返回依赖主库提供的协议头  
+```
+主库执行:  
+drop database test;  
+create database test;  
+
+binlog Event:  
+08 10 13:47:49.221  INFO mysqltest:119       : Slave semi-sync status off         
+08 10 13:47:49.223  INFO mysqltest:139       : Event mysql-bin.000002 1963 recorded
+08 10 13:47:49.223  INFO mysqltest:119       : Slave semi-sync status on
+08 10 13:47:49.224  INFO mysqltest:129       : Ack mysql-bin.000002 2048 replied
+08 10 13:47:49.224  INFO mysqltest:139       : Event mysql-bin.000002 2048 recorded
+08 10 13:47:50.287  INFO mysqltest:119       : Slave semi-sync status off
+08 10 13:47:50.287  INFO mysqltest:139       : Event mysql-bin.000002 2090 recorded
+08 10 13:47:50.288  INFO mysqltest:119       : Slave semi-sync status on
+08 10 13:47:50.288  INFO mysqltest:129       : Ack mysql-bin.000002 2177 replied
+08 10 13:47:50.289  INFO mysqltest:139       : Event mysql-bin.000002 2177 recorded
+```
+
+2、binlog事件落盘后是否能通过mysqlbinlog识别
+在落盘前需要对事件的data进行 checksum验证，算法是 CRC32
+
+Event { fde: FormatDescriptionEvent { binlog_version: Const(Version4, PhantomData<mysql_common::misc::raw::int::LeU16>), server_version: RawBytes { value: "10.3.3
+9-MariaDB-1:10.3.39+maria~ubu2004-log\0\0\0\0\0\0\0", max_len: "50" }, create_timestamp: 0, event_header_length: ConstU8(PhantomData<mysql_common::binlog::events::format_description_event::InvalidEventHeaderLe
+ngth>), event_type_header_lengths: RawBytes { value: "8\r\0\u{8}\0\u{12}\0\u{4}\u{4}\u{4}\u{4}\u{12}\0\0�\0\u{4}\u{1a}\u{8}\0\0\0\u{8}\u{8}\u{8}\u{2}\0\0\0\n\n\n\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0
+\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\
+u{4}\u{13}\u{4}\0\r\u{8}\u{8}\u{8}\n\n\n", max_len: "18446744073709551615" }, footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_CRC32), checksum_enabled: true } }, header: BinlogEventHeader { 
+timestamp: 1754804870, event_type: QUERY_EVENT, server_id: 1000, event_size: 87, log_pos: 2177, flags: EventFlags(LOG_EVENT_SUPPRESS_USE_F) }, data: [51, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 26, 0, 0, 0, 0, 0, 0, 1, 
+0, 0, 32, 84, 0, 0, 0, 0, 6, 3, 115, 116, 100, 4, 33, 0, 33, 0, 8, 0, 116, 101, 115, 116, 0, 99, 114, 101, 97, 116, 101, 32, 100, 97, 116, 97, 98, 97, 115, 101, 32, 116, 101, 115, 116], footer: BinlogEventFoot
+er { checksum_alg: Some(BINLOG_CHECKSUM_ALG_CRC32), checksum_enabled: true }, checksum: [151, 21, 69, 206] }
+
+
+3、binlog日志应用
+   方案1：每次应用都需要重启slave, reset slave （公司产品验证可行，邮件：回复: 回复: 黑匣子半同步升降级逻辑）
+   方案2：启动一个mysql server模拟器，读取本地的binlog日志后发送到目标的slave
+
+4、程序高可用问题
+前提：
+rpl_semi_sync_master_wait_for_slave_count 需要等于 所有slave节点数
+
+当主库开启半同步复制时，事务提交后不会立即向客户端返回成功，而是会等待至少 rpl_semi_sync_master_wait_for_slave_count 个从库确认已接收并写入中继日志（relay log）。
+只有满足该数量条件后，主库才会向客户端返回事务提交成功的信息。
+
+5、写入黑匣子
+   append的方式写入
+   位点信息保存在哪里？
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 **模拟测试情况：**
 ```

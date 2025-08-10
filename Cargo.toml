@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+byteorder = "1.5.0"
+clap = {version = "4.5.43", features = ["derive", "env", "cargo"]}
 futures-util = "0.3.31"
 log = "0.4.27"
 log4rs = {version = "1.3.0", features=["all_components", "config_parsing", "toml_format"]}

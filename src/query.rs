@@ -1,7 +1,7 @@
 use std::sync::LazyLock;
 
 use mysql_async::{
-    Conn,
+    Conn, QueryResult, TextProtocol,
     prelude::{FromRow, Queryable},
 };
 use regex::bytes::Regex;
@@ -38,38 +38,27 @@ impl Replica {
 pub async fn show_replicas(
     conn: &mut Conn,
 ) -> std::result::Result<Vec<Replica>, mysql_async::Error> {
+    async fn foreach(mut slaves: QueryResult<'_, 'static, TextProtocol>) -> Vec<Replica> {
+        let mut replicas = Vec::new();
+        slaves
+            .for_each(|row| {
+                replicas.push(Replica {
+                    server_id: row.get(0).unwrap(),
+                    host: row.get(1),
+                    port: row.get(2).unwrap(),
+                    master_id: row.get(3).unwrap(),
+                    replica_uuid: row.get(4),
+                });
+            })
+            .await
+            .unwrap();
+        replicas
+    }
+
     let replicas = match conn.query_iter("show replicas").await {
-        Ok(mut slaves) => {
-            let mut replicas = Vec::new();
-            let data = slaves
-                .for_each(|row| {
-                    replicas.push(Replica {
-                        server_id: row.get(0).unwrap(),
-                        host: row.get(1),
-                        port: row.get(2).unwrap(),
-                        master_id: row.get(3).unwrap(),
-                        replica_uuid: None,
-                    });
-                })
-                .await;
-            replicas
-        }
+        Ok(mut slaves) => foreach(slaves).await,
         Err(_) => match conn.query_iter("show slave hosts").await {
-            Ok(mut slaves) => {
-                let mut replicas = Vec::new();
-                let data = slaves
-                    .for_each(|row| {
-                        replicas.push(Replica {
-                            server_id: row.get(0).unwrap(),
-                            host: row.get(1),
-                            port: row.get(2).unwrap(),
-                            master_id: row.get(3).unwrap(),
-                            replica_uuid: None,
-                        });
-                    })
-                    .await;
-                replicas
-            }
+            Ok(mut slaves) => foreach(slaves).await,
             Err(e) => return Err(e),
         },
     };
@@ -113,11 +102,22 @@ pub async fn master_server_uuid(
 //
 // MySQL	5.6	    gtid_mode = ON
 // MariaDB	10.0.2	gtid_strict_mode = ON
+//
+// For Use build-in Function
+// SELECT BINLOG_GTID_POS("master-bin.000001", 600);
 pub async fn master_gtid_mode(
     conn: &mut Conn,
 ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
-    let strings: Option<String> = conn.query_first("select @@gtid_mode").await?;
-    Ok(strings != Some("OFF".to_owned()))
+    if is_mariadb(conn).await? {
+        return Ok(conn.server_version() >= (10, 0, 2));
+    } else {
+        // MySQL
+        if conn.server_version() < (5, 6, 0) {
+            return Ok(false);
+        }
+        let strings: Option<String> = conn.query_first("select @@gtid_mode").await?;
+        Ok(strings != Some("OFF".to_owned()))
+    }
 }
 
 // for mysql, mariadb default true
@@ -131,4 +131,36 @@ static MARIADB_VERSION_RE: LazyLock<Regex> =
 pub async fn is_mariadb(conn: &mut Conn) -> std::result::Result<bool, Box<dyn std::error::Error>> {
     let strings: Option<String> = conn.query_first("select version()").await?;
     Ok(MARIADB_VERSION_RE.is_match(strings.unwrap().as_bytes()))
+}
+
+// Call BINLOG_GTID_POS for mariadb
+pub async fn binlog_gtid_pos(
+    conn: &mut Conn,
+    pos: u64,
+    filename: &[u8],
+) -> std::result::Result<Option<String>, Box<dyn std::error::Error>> {
+    if is_mariadb(conn).await? {
+        if conn.server_version() >= (10, 0, 2) {
+            let mut query = conn
+                .exec_iter("SELECT BINLOG_GTID_POS(?, ?)", (filename, pos))
+                .await?;
+            let mut ret: Option<String> = None;
+            query
+                .for_each(|row| {
+                    let s: Option<Result<String, mysql_async::FromValueError>> = row.get_opt(0);
+                    if let Some(e) = s {
+                        ret = match e {
+                            Ok(v) => Some(v),
+                            Err(_) => None,
+                        };
+                    }
+                })
+                .await
+                .unwrap();
+            return Ok(ret);
+        }
+    } else {
+        // MySQL, BINLOG_GTID_POS does not exist
+    }
+    Ok(None)
 }

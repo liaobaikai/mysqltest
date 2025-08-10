@@ -4,6 +4,8 @@ user = "root"
 pass = "123456"
 port = 4406
 max_allowed_packet = 67108864
+# start_position = 4
+start_filename = ""
 # init_sql=[]
 
 [local]
