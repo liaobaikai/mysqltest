@@ -3,14 +3,14 @@ use serde::Deserialize;
 
 pub const NAME: &str = env!("CARGO_PKG_NAME");
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct MyConfig {
-    pub master: MyConfigMaster,
-    pub local: MyConfigLocal,
+    pub mysql: MyConfigForMySQL,
+    pub replica: MyConfigForReplica,
 }
 
-#[derive(Deserialize)]
-pub struct MyConfigMaster {
+#[derive(Deserialize, Clone)]
+pub struct MyConfigForMySQL {
     pub host: String,
     pub user: Option<String>,
     pub pass: Option<String>,
@@ -21,15 +21,33 @@ pub struct MyConfigMaster {
     pub init_sql: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
-pub struct MyConfigLocal {
-    pub rpl_semi_sync_slave_enabled: Option<usize>,
-    // 自动生成
-    pub slave_id: Option<u32>,
-    pub slave_uuid: Option<String>,
-    pub register_slave_port: Option<u16>,
-    pub register_slave_host: Option<String>,
+#[derive(Deserialize, Clone)]
+pub struct MyConfigForReplica {
+
+    pub replica_id: Option<u32>,
+    pub replica_uuid: Option<String>,
+    pub report_port: Option<u16>,
+    pub report_host: Option<String>,
+
     pub datadir: String,
+    // Default Value: datadir + '/' + 'relay-bin'
+    pub relay_log_basename: Option<String>,
+    // Default Value: relay-bin
+    pub relay_log: Option<String>,
+    // Default Value: relay-bin.index
+    pub relay_log_index: Option<String>,
+    // Default Value: 1
+    pub relay_log_purge: Option<usize>,
+    // Default Value: 1
+    pub relay_log_recovery: Option<usize>,
+    // Default Value: 0
+    pub rpl_semi_sync_replica_enabled: Option<usize>,
+    // Default Value: 1024
+    pub replica_max_allowed_packet: Option<usize>,
+    // Default Value: 1
+    pub replica_verify_checksum: Option<usize>,
+    // skip_event = "ROTATE_EVENT"
+    pub skip_event: Option<Vec<u8>>,
 }
 
 // https://docs.rs/clap/latest/clap/_derive/index.html

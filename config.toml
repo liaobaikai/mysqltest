@@ -1,18 +1,34 @@
-[master]
+[mysql]
 host = "localhost"
 user = "root"
 pass = "123456"
 port = 4406
-max_allowed_packet = 67108864
+# max_allowed_packet = 67108864
 # start_position = 4
-start_filename = ""
+# start_filename = ""
 # init_sql=[]
 
-[local]
+[replica]
+replica_id = 5000
+replica_uuid = "79a87595-66fe-42cd-b235-e686346fbfc0"
+report_port = 8527
+report_host = "mysql-avatar"
 datadir = "./data"
-rpl_semi_sync_slave_enabled = 1
-# Options:
-# slave_id = 5000
-slave_uuid = "79a87595-66fe-42cd-b235-e686346fbfc0"
-register_slave_port = 8527
-register_slave_host = "mysql-avatar"
+
+# Relay Log Section
+# Default Value: datadir + '/' + 'relay-bin'
+relay_log_basename = "./data/relay-bin/"
+relay_log = "relay-bin"
+relay_log_index = "relay-bin.index"
+# Unused.
+relay_log_purge = 1
+# Unused.
+relay_log_recovery = 1
+
+# 
+rpl_semi_sync_replica_enabled = 1
+# Unused.
+replica_max_allowed_packet = 1024
+replica_verify_checksum = 1
+# 
+skip_event = [ 0x04 ]

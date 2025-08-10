@@ -67,14 +67,21 @@ pub async fn show_replicas(
 
 // Query:
 // select @@rpl_semi_sync_master_enabled
+// select @@rpl_semi_sync_source_enabled
 pub async fn rpl_semi_sync_master_enabled(
     conn: &mut Conn,
 ) -> std::result::Result<usize, Box<dyn std::error::Error>> {
-    let strings: Option<String> = conn
-        .query_first("select @@rpl_semi_sync_master_enabled")
-        .await?;
-    // let enabled = strings.unwrap_or_default().parse::<usize>()?;
-    Ok(strings.unwrap_or_default().parse::<usize>()?)
+    let enabled: Option<usize> = match conn
+        .query_first("select @@rpl_semi_sync_source_enabled")
+        .await
+    {
+        Ok(v) => v,
+        Err(_) => {
+            conn.query_first("select @@rpl_semi_sync_master_enabled")
+                .await?
+        }
+    };
+    Ok(enabled.unwrap())
 }
 
 // Query:
