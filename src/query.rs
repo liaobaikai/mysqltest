@@ -31,6 +31,25 @@ impl Replica {
     }
 }
 
+// for mysql, mariadb default true
+// Query:
+// select @@gtid_mode
+//
+// MySQL	5.6	    gtid_mode = ON
+// MariaDB	10.0.2	gtid_strict_mode = ON
+static MARIADB_VERSION_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?:5.5.5-)?(\d{1,2})\.(\d{1,2})\.(\d{1,3})-MariaDB").unwrap());
+pub trait ConnExt {
+    async fn is_mariadb(&mut self) -> std::result::Result<bool, mysql_async::Error>;
+}
+
+impl ConnExt for Conn {
+    async fn is_mariadb(&mut self) -> std::result::Result<bool, mysql_async::Error> {
+        let version: Option<String> = self.query_first("select version()").await?;
+        Ok(MARIADB_VERSION_RE.is_match(version.unwrap().as_bytes()))
+    }
+}
+
 // Query:
 // Old Version: show slave hosts
 // New Version: show replicas
@@ -123,7 +142,7 @@ pub async fn master_server_uuid(
 pub async fn master_gtid_mode(
     conn: &mut Conn,
 ) -> std::result::Result<bool, Box<dyn std::error::Error>> {
-    if is_mariadb(conn).await? {
+    if conn.is_mariadb().await? {
         return Ok(conn.server_version() >= (10, 0, 2));
     } else {
         // MySQL
@@ -135,26 +154,13 @@ pub async fn master_gtid_mode(
     }
 }
 
-// for mysql, mariadb default true
-// Query:
-// select @@gtid_mode
-//
-// MySQL	5.6	    gtid_mode = ON
-// MariaDB	10.0.2	gtid_strict_mode = ON
-static MARIADB_VERSION_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:5.5.5-)?(\d{1,2})\.(\d{1,2})\.(\d{1,3})-MariaDB").unwrap());
-pub async fn is_mariadb(conn: &mut Conn) -> std::result::Result<bool, Box<dyn std::error::Error>> {
-    let strings: Option<String> = conn.query_first("select version()").await?;
-    Ok(MARIADB_VERSION_RE.is_match(strings.unwrap().as_bytes()))
-}
-
 // Call BINLOG_GTID_POS for mariadb
 pub async fn binlog_gtid_pos(
     conn: &mut Conn,
     pos: u64,
     filename: &[u8],
 ) -> std::result::Result<Option<String>, Box<dyn std::error::Error>> {
-    if is_mariadb(conn).await? {
+    if conn.is_mariadb().await? {
         if conn.server_version() >= (10, 0, 2) {
             let mut query = conn
                 .exec_iter("SELECT BINLOG_GTID_POS(?, ?)", (filename, pos))

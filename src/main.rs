@@ -5,22 +5,20 @@
 
 use std::{
     fs::{File, OpenOptions, create_dir_all, remove_dir_all},
-    io::{Read, Write},
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::exit,
 };
 
 use byteorder::{ByteOrder, LittleEndian};
-use clap::Parser;
 use futures_util::StreamExt;
 use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool, binlog::BinlogChecksumAlg};
 use mysql_common::binlog::BinlogFileHeader;
-use uuid::Uuid;
 
 use crate::{
-    prelude::{Args, MyConfig, NAME},
+    prelude::{MyConfig, NAME, prelude},
     query::{
-        binlog_gtid_pos, is_mariadb, master_gtid_mode, master_server_id, master_server_uuid,
+        ConnExt, binlog_gtid_pos, master_gtid_mode, master_server_id, master_server_uuid,
         rpl_semi_sync_master_enabled, show_replicas, sysvar_log_bin,
     },
 };
@@ -38,41 +36,93 @@ fn strip_prefix(raw: &[u8]) -> &[u8] {
     &raw[pos..]
 }
 
-fn gen_relaylog_filename(relay_log_prefix: &str, filename: &str) -> String {
-    if filename == "mysql-bin.00" {
-        println!("xxx")
-    }
-    format!("{}_{}", relay_log_prefix, filename)
-}
-
 // 创建一个新的relaylog文件
-fn new_relaylog_file(
-    relay_log_prefix: &str,
-    filename: &str,
-) -> std::result::Result<File, Box<dyn std::error::Error>> {
+//   读取index文件，获取最后一行，通过最后一行记录来计算下一个文件后缀
+// relay_log_basename: 基础路径
+// relay_log: 文件名前缀
+// relay_log_index: index文件名
+fn next_relaylog_file(
+    relay_log_basename: &str,
+    relay_log: &str,
+    relay_log_index: &str,
+    current_relaylog: &mut String,
+) -> std::result::Result<File, std::io::Error> {
+    // 只读取10个字节的文件后缀名
+    let seek_len = -10;
+    // ... \n
+    // \n
+    // seek_len += 2;
+    // emmm, only get extension.
+
+    let mut relay_log_index_file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .read(true)
+        .create(true)
+        .open(Path::new(relay_log_basename).join(relay_log_index))?;
+
+    let sequence = if let Ok(_size) = relay_log_index_file.seek(SeekFrom::End(seek_len)) {
+        // relay-bin.000000001\n
+        //           |----10--|
+        //           |----9--|
+        let mut buf: Vec<u8> = vec![0; 9];
+        relay_log_index_file.read_exact(&mut buf).unwrap();
+        let n = String::from_utf8_lossy(&buf).to_string();
+        match n.parse() {
+            Ok(n) => n,
+            Err(_) => {
+                log::error!("Relay_log_index parse error, {:?} expect is number", n);
+                exit(127);
+            }
+        }
+    } else {
+        // init=0
+        0
+    };
+
+    let relaylog_file_path = Path::new(relay_log_basename).join(format!(
+        "{}.{}",
+        relay_log,
+        format!("{:>09}", sequence + 1)
+    ));
     let mut relaylog_file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(true)
-        .open(gen_relaylog_filename(relay_log_prefix, filename))?;
+        .open(&relaylog_file_path)?;
     relaylog_file.write_all(&BinlogFileHeader::VALUE)?;
+
+    // 写index文件
+    current_relaylog.clear();
+    current_relaylog.push_str(&relaylog_file_path.display().to_string());
+    relay_log_index_file.write_all(format!("{}\n", current_relaylog.clone()).as_bytes())?;
+    relay_log_index_file.flush()?;
 
     Ok(relaylog_file)
 }
 
-fn write_relaylog_index(
-    relaylog_index_file: &PathBuf,
-    newfile: &str,
-) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let mut index_file = OpenOptions::new()
+fn next_dump_event(
+    dump_file_basename: &PathBuf,
+    current_relaylog: &str,
+    log_file_name: &str,
+    log_file_pos: u64,
+    dump_filename: &mut String,
+) -> std::result::Result<File, std::io::Error> {
+    let dump_file = dump_file_basename.join(format!(
+        "{}_{}_{}.dump",
+        current_relaylog, log_file_name, log_file_pos
+    ));
+
+    dump_filename.clear();
+    dump_filename.push_str(&dump_file.display().to_string());
+
+    OpenOptions::new()
+        .read(true)
         .write(true)
-        .append(true)
         .create(true)
-        .open(&relaylog_index_file)?;
-    index_file.write_all(format!("{}\n", newfile).as_bytes())?;
-    index_file.flush()?;
-    Ok(())
+        .truncate(true)
+        .open(&dump_file)
 }
 
 async fn pull_binlog_events(
@@ -81,25 +131,32 @@ async fn pull_binlog_events(
     request: BinlogStreamRequest<'_>,
     config: &MyConfig,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let relay_log_basename = config.replica.relay_log_basename.clone().unwrap();
+    let relay_log_basename = &config.replica.relay_log_basename.clone().unwrap();
 
     // 每次启动前清理relaylog的目录文件
-    remove_dir_all(&relay_log_basename)?;
-    create_dir_all(&relay_log_basename)?;
+    if let Err(e) = remove_dir_all(&relay_log_basename) {
+        if e.kind() != ErrorKind::NotFound {
+            log::error!("Clean relay_log_basename failed: {}", e);
+            exit(1);
+        }
+    }
 
-    let relay_log_prefix =
-        Path::new(&relay_log_basename).join(&config.replica.relay_log.clone().unwrap());
-    let relay_log_prefix = relay_log_prefix.to_string_lossy();
+    if let Err(e) = create_dir_all(&relay_log_basename) {
+        log::error!("Create relay_log_basename failed: {}", e);
+        exit(1);
+    }
+
+    let relaylog = &config.replica.relay_log.clone().unwrap();
+    let relaylog_index = &config.replica.relay_log_index.clone().unwrap();
+    let mut current_relaylog = relaylog.to_owned();
 
     // New file on start, when file exists truncated it.
-    let mut relaylog_file = new_relaylog_file(&relay_log_prefix, &log_file_name)?;
-    let relaylog_index_file =
-        Path::new(&relay_log_basename).join(&config.replica.relay_log_index.clone().unwrap());
-    // let relaylog_index_file = relaylog_index_file.to_string_lossy();
-
-    let mut relaylog_index_value = gen_relaylog_filename(&relay_log_prefix, &log_file_name);
-    write_relaylog_index(&relaylog_index_file, &relaylog_index_value)?;
-
+    let mut relaylog_file = next_relaylog_file(
+        relay_log_basename,
+        relaylog,
+        relaylog_index,
+        &mut current_relaylog,
+    )?;
     let mut log_file_pos;
 
     let mut binlog_stream = match conn.get_binlog_stream(request).await {
@@ -144,34 +201,36 @@ async fn pull_binlog_events(
                 // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
                 // mysql8.0.41: ROTATE_EVENT should_binlog_bytes: [109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 57]
                 // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 52], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
-                let mut valid_chars = Vec::new();
+                let mut final_binlog_bytes = Vec::new();
                 for &byte in should_binlog_bytes {
                     if (32..=126).contains(&byte) {
-                        valid_chars.push(byte);
+                        final_binlog_bytes.push(byte);
                     } else {
                         // 遇到非可打印字符，终止提取
                         break;
                     }
                 }
+
+                // log::debug!("ROTATE_EVENT calc_checksum: {}", event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32));
                 log::debug!(
-                    "ROTATE_EVENT should_binlog_bytes: {:?}",
-                    should_binlog_bytes
+                    "ROTATE_EVENT should_binlog_bytes: {:?}, final_binlog_bytes: {:?}",
+                    should_binlog_bytes,
+                    final_binlog_bytes
                 );
-                log::debug!("ROTATE_EVENT valid_chars: {:?}", valid_chars);
-
-                log_file_name = String::from_utf8_lossy(strip_prefix(&valid_chars)).to_string();
-
-                relaylog_file.flush()?;
-                relaylog_file.sync_all()?;
+                log_file_name =
+                    String::from_utf8_lossy(strip_prefix(&final_binlog_bytes)).to_string();
 
                 // new binlog file
-                relaylog_file = new_relaylog_file(&relay_log_prefix, &log_file_name)?;
-
-                let newfile = gen_relaylog_filename(&relay_log_prefix, &log_file_name);
-                if relaylog_index_value != newfile {
-                    // 写 index 文件
-                    write_relaylog_index(&relaylog_index_file, &relaylog_index_value)?;
-                    relaylog_index_value = newfile;
+                // 如果上一个文件只有4个字节，那就不用切文件
+                if relaylog_file.metadata().unwrap().len() > BinlogFileHeader::VALUE.len() as u64 {
+                    relaylog_file.flush()?;
+                    relaylog_file.sync_all()?;
+                    relaylog_file = next_relaylog_file(
+                        relay_log_basename,
+                        relaylog,
+                        relaylog_index,
+                        &mut current_relaylog,
+                    )?;
                 }
 
                 // Remarks:
@@ -239,14 +298,26 @@ async fn pull_binlog_events(
                         log_file_name,
                         log_file_pos
                     );
-                    let dump_file = format!("{}.{}.dump", log_file_name, log_file_pos);
-                    let relaylog_file_dump =
-                        new_relaylog_file(&config.replica.relay_log.clone().unwrap(), &dump_file)?;
+                    // relay_log_basename/diag/{current_relaylog}_{log_file_name}_{log_file_pos}.dump
+                    let mut dump_filename = String::new();
+                    let dump_file_basename = Path::new(relay_log_basename).join("diag");
+                    create_dir_all(&dump_file_basename)?;
                     match event.write(
                         mysql_async::binlog::BinlogVersion::Version4,
-                        &relaylog_file_dump,
+                        &next_dump_event(
+                            &dump_file_basename,
+                            &current_relaylog,
+                            &log_file_name,
+                            log_file_pos,
+                            &mut dump_filename,
+                        )?,
                     ) {
-                        Ok(()) => log::info!("Event {} {} dumped", dump_file, log_file_pos),
+                        Ok(()) => log::info!(
+                            "Event {} {} dumped to {}",
+                            &log_file_name,
+                            log_file_pos,
+                            dump_filename
+                        ),
                         Err(e) => log::error!("Event dump failed: {e}"),
                     }
                 }
@@ -276,134 +347,10 @@ async fn pull_binlog_events(
 
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    let (config, args, log_file_name, log_file_pos) = prelude()?;
 
-    log4rs::init_file("./log4rs.toml", Default::default())?;
-
-    let config_path = "./config.toml";
-    let mut config_file = match File::open(config_path) {
-        Ok(f) => f,
-        Err(e) => {
-            println!("Config file {} open failed, {e}", config_path);
-            exit(1);
-        }
-    };
-
-    let mut buf = String::new();
-    config_file.read_to_string(&mut buf)?;
-
-    let mut config: MyConfig = toml::from_str(&buf)?;
-
-    let log_file_name = match args.start_filename {
-        Some(v) => v,
-        None => match config.mysql.start_filename.clone() {
-            Some(v) if !v.is_empty() => v,
-            _ => {
-                println!("Using --with-file, --start-filename is requred");
-                exit(1);
-            }
-        },
-    };
-
-    log::info!("Start_filename={:?}", log_file_name);
-    let log_file_pos = match args.start_position {
-        Some(v) => v,
-        None => match config.mysql.start_position {
-            Some(v) if v > 0 => v,
-            _ => {
-                println!("Using --with-file, --start-position is requred");
-                exit(1);
-            }
-        },
-    };
-    log::info!("Start_position={}", log_file_pos);
-
-    // let build_time = match option_env!("BUILD_TIME") {
-    //     Some(k) => format!(" on {}", k),
-    //     None => String::new(),
-    // };
-
-    // mysql avatar
-    let replica_uuid = match config.replica.replica_uuid.clone() {
-        Some(id) => id,
-        None => {
-            // 没有指定UUID，那就自己生成一个
-            Uuid::new_v4().to_string()
-        }
-    };
-
-    // 是否启动半同步复制
-    let rpl_semi_sync_replica_enabled = config
-        .replica
-        .rpl_semi_sync_replica_enabled
-        .unwrap_or_default();
-
-    if config.replica.relay_log_basename.is_none() {
-        config.replica.relay_log_basename = Some(
-            Path::new(&config.replica.datadir)
-                .join("relay-bin")
-                .to_string_lossy()
-                .to_string(),
-        )
-    }
-
-    log::info!(
-        "Replica_id={}",
-        match config.replica.replica_id.clone() {
-            Some(v) => format!("{}", v),
-            None => format!("<Not set>"),
-        }
-    );
-
-    log::info!("Replica_uuid={:?}", replica_uuid);
-
-    log::info!(
-        "Relay_log_basename={:?}",
-        config.replica.relay_log_basename.clone().unwrap()
-    );
-
-    if config.replica.relay_log.clone().is_none() {
-        config.replica.relay_log = Some(String::from("relay-bin"))
-    }
-
-    log::info!("Relay_log={:?}", config.replica.relay_log.clone().unwrap());
-    if config.replica.relay_log_index.clone().is_none() {
-        config.replica.relay_log_index = Some(String::from("relay-bin.index"))
-    }
-    log::info!(
-        "Relay_log_index={:?}",
-        config.replica.relay_log_index.clone().unwrap()
-    );
-
-    // Replica_verify_checksum
-    log::info!(
-        "Replica_verify_checksum={}",
-        match config.replica.replica_verify_checksum {
-            Some(v) => v,
-            None => 0,
-        }
-    );
-
-    log::info!(
-        "Rpl_semi_sync_replica_enabled={}",
-        rpl_semi_sync_replica_enabled
-    );
-
-    let mut init = vec![
-        format!(
-            "SET @rpl_semi_sync_replica = {}, @rpl_semi_sync_slave = {}",
-            rpl_semi_sync_replica_enabled, rpl_semi_sync_replica_enabled
-        ),
-        format!(
-            "SET @replica_uuid = '{}', @slave_uuid = '{}'",
-            replica_uuid, replica_uuid
-        ),
-    ];
-
-    // 可以指定初始化sql
-    if let Some(mut init_sqls) = config.mysql.init_sql.clone() {
-        init.append(&mut init_sqls);
-    }
+    let log4rs_config_file = option_env!("MYSQL_AVATAR_LOG4RS_FILE").unwrap_or("./log4rs.toml");
+    log4rs::init_file(log4rs_config_file, Default::default())?;
 
     let host = match args.host.clone() {
         Some(host) => host,
@@ -431,7 +378,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .pass(Some(pass))
         .max_allowed_packet(config.mysql.max_allowed_packet)
         .tcp_port(port)
-        .init(init);
+        .init(config.mysql.init_sql.clone().unwrap());
 
     let pool = Pool::new(opts);
     let mut conn = match pool.get_conn().await {
@@ -442,8 +389,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     };
     log::debug!("{:?}", conn);
+
     let (v1, v2, v3) = conn.server_version();
-    let is_maria = is_mariadb(&mut conn).await?;
+    let is_maria = conn.is_mariadb().await?;
     log::info!(
         "Connected to {} Server {}:{}, process id {}, version {}.{}.{}",
         if is_maria { "MariaDB" } else { "MySQL" },
@@ -527,6 +475,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let rpl_semi_sync_replica_enabled = config
+        .replica
+        .rpl_semi_sync_replica_enabled
+        .unwrap_or_default();
     if rpl_semi_sync_replica_enabled == 1 && rpl_semi_sync_master_enabled != 1 {
         log::error!(
             "Rpl_semi_sync_master_enabled={}, expected rpl_semi_sync_master_enabled=1",
@@ -596,10 +548,57 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs::File,
+        io::{Read, Seek, SeekFrom},
+        path::Path,
+    };
+
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
+
+    // #[test]
+    // fn test_rotate_event_checksum(){
+
+    //     let final_binlog_bytes= [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49];
+    //     let recv_bytes = [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104];
+    //     let checksum = [31, 14, 172, 104];
+
+    //     let v1 = LittleEndian::read_u32(&checksum);
+    //     let mut hasher = crc32fast::Hasher::new();
+
+    //     let v2 = LittleEndian::read_u32(&final_binlog_bytes);
+    //     assert_eq!(v1, v2);
+    // }
+
+    #[test]
+    fn test_read_relaylog_index() {
+        let mut file = File::open("./data/relay-bin/relay-bin.index").unwrap();
+        file.seek(SeekFrom::End(-10)).unwrap();
+        let mut buf = String::new();
+        file.read_to_string(&mut buf).unwrap();
+        println!("data: {buf}");
+        let path = Path::new(&buf);
+        let sequence: u32 = path
+            .extension()
+            .unwrap()
+            .to_string_lossy()
+            .trim_end_matches("\n")
+            .parse()
+            .unwrap();
+        println!("sequence: {:?}", sequence);
+        println!(
+            "extension: {:?}",
+            path.extension()
+                .unwrap()
+                .to_string_lossy()
+                .trim_end_matches("\n")
+        );
+        let path = Path::new(&buf).with_extension(format!("{:>09}", sequence + 1));
+        println!("path: {:?}", path);
+    }
 
     // 模拟一个mysqlserver，给slave发送binlog日志
     #[tokio::test]

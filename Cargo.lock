@@ -928,6 +928,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "clap",
+ "crc32fast",
  "futures-util",
  "log",
  "log4rs",
