@@ -30,6 +30,9 @@ mod query;
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 // pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
+// relaylog日志编号长度: 000000001 ~ 999999999
+const RELAY_LOG_SUFFIX_LEN: usize = 9;
+
 // Hacky way to cut start [0 0 0 ...]
 fn strip_prefix(raw: &[u8]) -> &[u8] {
     let pos = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
@@ -48,7 +51,7 @@ fn next_relaylog_file(
     current_relaylog: &mut String,
 ) -> std::result::Result<File, std::io::Error> {
     // 只读取10个字节的文件后缀名
-    let seek_len = -10;
+    let seek_len: i64 = -((RELAY_LOG_SUFFIX_LEN + 1) as i64);
     // ... \n
     // \n
     // seek_len += 2;
@@ -65,7 +68,7 @@ fn next_relaylog_file(
         // relay-bin.000000001\n
         //           |----10--|
         //           |----9--|
-        let mut buf: Vec<u8> = vec![0; 9];
+        let mut buf: Vec<u8> = vec![0; RELAY_LOG_SUFFIX_LEN];
         relay_log_index_file.read_exact(&mut buf).unwrap();
         let n = String::from_utf8_lossy(&buf).to_string();
         match n.parse() {
