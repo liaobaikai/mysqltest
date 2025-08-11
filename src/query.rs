@@ -85,6 +85,14 @@ pub async fn rpl_semi_sync_master_enabled(
 }
 
 // Query:
+// select @@log_bin
+pub async fn sysvar_log_bin(
+    conn: &mut Conn,
+) -> std::result::Result<usize, Box<dyn std::error::Error>> {
+    Ok(conn.query_first("select @@log_bin").await?.unwrap())
+}
+
+// Query:
 // select @@server_id
 pub async fn master_server_id(
     conn: &mut Conn,

@@ -1,4 +1,6 @@
 .\mysql_common-0.35.5\src\proto\codec\mod.rs#
+./mysql_common-0.35.5/src/proto/codec/mod.rs
+
 527->UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
 if self.seq_id != chunk_info.seq_id() {
                     match comp_seq_id {
@@ -52,7 +54,7 @@ impl BinlogStream {
             esr: EventStreamReader::new(Version4),
             tpe: None,
 91++++++++++++++++++++++++++++++++++
-            semi_sync: false,
+            sync_flag: false,
             need_reply: false,
         }
     }
@@ -65,17 +67,19 @@ impl BinlogStream {
     }
 
     pub fn get_semi_sync_status(&self) -> (bool, bool) {
-        (self.semi_sync, self.need_reply)
+        (self.sync_flag, self.need_reply)
     }
 
 
 
+
+mysql_async-0.36.1/src/conn/binlog_stream/mod.rs
 .\mysql_async-0.36.1\src\conn\binlog_stream\mod.rs#161
 
 179->UUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUUU
 if first_byte == Some(0) {
             let mut event_data = &packet[1..];
-            self.semi_sync = event_data[0] == 0xef;
+            self.sync_flag = event_data[0] == 0xef;
             if event_data[0] == 0xef {
                 self.need_reply = event_data[1] == 0x01;
                 event_data = &packet[3..];

@@ -37,12 +37,15 @@ pub struct MyConfigForReplica {
     // Default Value: relay-bin.index
     pub relay_log_index: Option<String>,
     // Default Value: 1
+    #[allow(unused)]
     pub relay_log_purge: Option<usize>,
     // Default Value: 1
+    #[allow(unused)]
     pub relay_log_recovery: Option<usize>,
     // Default Value: 0
     pub rpl_semi_sync_replica_enabled: Option<usize>,
     // Default Value: 1024
+    #[allow(unused)]
     pub replica_max_allowed_packet: Option<usize>,
     // Default Value: 1
     pub replica_verify_checksum: Option<usize>,
@@ -67,8 +70,8 @@ pub struct Args {
     pub password: Option<String>,
 
     /// Port number to use for connection or built-in default (3306).
-    #[arg(short = 'P', long, default_value_t = 3306)]
-    pub port: u16,
+    #[arg(short = 'P', long)]
+    pub port: Option<u16>,
 
     /// Verify checksum binlog events.
     #[arg(long, default_value_t = false)]
@@ -93,21 +96,3 @@ pub struct Args {
     pub start_filename: Option<String>,
 }
 
-
-// pub fn init_logger() -> std::result::Result<(), Box<dyn std::error::Error>> {
-//     // let stdout = ConsoleAppender::builder().build();
-//     let logpath = Path::new("log").join(format!("{}.log", NAME));
-//     let file_appender = FileAppender::builder()
-//         .encoder(Box::new(PatternEncoder::new(
-//             "{d(%m %d %H:%M:%S%.3f)} {l:>5.5} {({M}:{L}):20.20}: {m}{n}",
-//         )))
-//         .build(logpath)?;
-
-//     let config = Config::builder()
-//         .appender(Appender::builder().build("file", Box::new(file_appender)))
-//         .build(Root::builder().appender("file").build(LevelFilter::Info))
-//         .unwrap();
-
-//     log4rs::init_config(config)?;
-//     Ok(())
-// }

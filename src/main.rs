@@ -4,7 +4,7 @@
 // @master_binlog_checksum：MySQL在5.6版本之后为binlog引入了checksum机制，从库需要与主库相关参数保持一致。
 
 use std::{
-    fs::{create_dir_all, File, OpenOptions},
+    fs::{File, OpenOptions, create_dir_all, remove_dir_all},
     io::{Read, Write},
     path::{Path, PathBuf},
     process::exit,
@@ -21,7 +21,7 @@ use crate::{
     prelude::{Args, MyConfig, NAME},
     query::{
         binlog_gtid_pos, is_mariadb, master_gtid_mode, master_server_id, master_server_uuid,
-        rpl_semi_sync_master_enabled, show_replicas,
+        rpl_semi_sync_master_enabled, show_replicas, sysvar_log_bin,
     },
 };
 mod prelude;
@@ -39,8 +39,8 @@ fn strip_prefix(raw: &[u8]) -> &[u8] {
 }
 
 fn gen_relaylog_filename(relay_log_prefix: &str, filename: &str) -> String {
-    if relay_log_prefix == "" {
-        println!("xxxxxxxxxxxx")
+    if filename == "mysql-bin.00" {
+        println!("xxx")
     }
     format!("{}_{}", relay_log_prefix, filename)
 }
@@ -61,7 +61,10 @@ fn new_relaylog_file(
     Ok(relaylog_file)
 }
 
-fn write_relaylog_index(relaylog_index_file: &PathBuf, newfile: &str) -> std::result::Result<(), Box<dyn std::error::Error>> {
+fn write_relaylog_index(
+    relaylog_index_file: &PathBuf,
+    newfile: &str,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let mut index_file = OpenOptions::new()
         .write(true)
         .append(true)
@@ -79,6 +82,9 @@ async fn pull_binlog_events(
     config: &MyConfig,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let relay_log_basename = config.replica.relay_log_basename.clone().unwrap();
+
+    // 每次启动前清理relaylog的目录文件
+    remove_dir_all(&relay_log_basename)?;
     create_dir_all(&relay_log_basename)?;
 
     let relay_log_prefix =
@@ -96,7 +102,13 @@ async fn pull_binlog_events(
 
     let mut log_file_pos;
 
-    let mut binlog_stream = conn.get_binlog_stream(request).await?;
+    let mut binlog_stream = match conn.get_binlog_stream(request).await {
+        Ok(s) => s,
+        Err(e) => {
+            log::error!("Binlog request failed, {}", e);
+            exit(1);
+        }
+    };
     while let Some(event) = binlog_stream.next().await {
         let event = event?;
         log_file_pos = event.header().log_pos() as u64;
@@ -118,16 +130,36 @@ async fn pull_binlog_events(
                 // start with first event, but after is 0
                 // 157 00, 00, 00, 00, 00, 00, 00, 62, 69, 6e, 6c, 6f, 67, 2e, 30, 30, 30, 30, 30, 31
                 // println!("ROTATE_EVENT::raw:: {:?}", event.data());
-                log::debug!("Event data: {:?}", event.data());
-                let data = &event.data()[1..];
-                let len = if event.checksum().is_none() {
-                    // event.data 最后4位校验码
-                    data.len() - 4
-                } else {
-                    data.len()
-                };
 
-                log_file_name = String::from_utf8_lossy(strip_prefix(&data[0..len])).to_string();
+                log::debug!("Event data: {:?}", event.data());
+
+                // Position 8bytes
+                let mut pos_bytes = [0_u8; 8];
+                event.data().read_exact(&mut pos_bytes)?;
+                let pos = u64::from_le_bytes(pos_bytes);
+                log::debug!("ROTATE_EVENT pos: {}", pos);
+
+                let should_binlog_bytes = &event.data()[8..];
+                // mariadb10.3.39: ROTATE_EVENT should_binlog_bytes: [109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104]
+                // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
+                // mysql8.0.41: ROTATE_EVENT should_binlog_bytes: [109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 57]
+                // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 52], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
+                let mut valid_chars = Vec::new();
+                for &byte in should_binlog_bytes {
+                    if (32..=126).contains(&byte) {
+                        valid_chars.push(byte);
+                    } else {
+                        // 遇到非可打印字符，终止提取
+                        break;
+                    }
+                }
+                log::debug!(
+                    "ROTATE_EVENT should_binlog_bytes: {:?}",
+                    should_binlog_bytes
+                );
+                log::debug!("ROTATE_EVENT valid_chars: {:?}", valid_chars);
+
+                log_file_name = String::from_utf8_lossy(strip_prefix(&valid_chars)).to_string();
 
                 relaylog_file.flush()?;
                 relaylog_file.sync_all()?;
@@ -373,16 +405,42 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         init.append(&mut init_sqls);
     }
 
+    let host = match args.host.clone() {
+        Some(host) => host,
+        None => config.mysql.host.clone(),
+    };
+
+    let user = match args.user.clone() {
+        Some(user) => user,
+        None => config.mysql.user.clone().unwrap_or(String::from("root")),
+    };
+
+    let pass = match args.password.clone() {
+        Some(pass) => pass,
+        None => config.mysql.pass.clone().unwrap_or_default(),
+    };
+
+    let port = match args.port.clone() {
+        Some(port) => port,
+        None => config.mysql.port.unwrap_or(3306),
+    };
+
     let opts = OptsBuilder::default()
-        .ip_or_hostname(config.mysql.host.clone())
-        .user(config.mysql.user.clone())
-        .pass(config.mysql.pass.clone())
+        .ip_or_hostname(host.clone())
+        .user(Some(user))
+        .pass(Some(pass))
         .max_allowed_packet(config.mysql.max_allowed_packet)
-        .tcp_port(config.mysql.port.unwrap_or(3306))
+        .tcp_port(port)
         .init(init);
 
     let pool = Pool::new(opts);
-    let mut conn = pool.get_conn().await?;
+    let mut conn = match pool.get_conn().await {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("Unable to connect to {}:{}, {}", host.clone(), port, e);
+            exit(1);
+        }
+    };
     log::debug!("{:?}", conn);
     let (v1, v2, v3) = conn.server_version();
     let is_maria = is_mariadb(&mut conn).await?;
@@ -404,7 +462,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     //     log::info!("Binlog_gtid_pos: {:?}", args.filename_or_gtid);
     // } else if args.with_file {
 
-    
     // } else {
     //     // Unknown
     // }
@@ -437,7 +494,6 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             id
         }
     };
-    
 
     let master_server_uuid = match master_server_uuid(&mut conn).await {
         Ok(v) => v.unwrap_or_default(),
@@ -449,6 +505,20 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     log::info!("Server_uuid={:?}", master_server_uuid);
 
+    match sysvar_log_bin(&mut conn).await {
+        Ok(log_bin) => {
+            if log_bin == 1 {
+                log::info!("Server log_bin={}", log_bin);
+            } else {
+                log::error!("Server log_bin={}, expected log_bin=1", log_bin);
+                exit(1);
+            }
+        }
+        Err(e) => {
+            log::error!("{e}");
+        }
+    };
+
     let rpl_semi_sync_master_enabled = match rpl_semi_sync_master_enabled(&mut conn).await {
         Ok(v) => v,
         Err(e) => {
@@ -456,10 +526,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             0
         }
     };
-    log::info!(
-        "Rpl_semi_sync_master_enabled={}",
-        rpl_semi_sync_master_enabled
-    );
+
+    if rpl_semi_sync_replica_enabled == 1 && rpl_semi_sync_master_enabled != 1 {
+        log::error!(
+            "Rpl_semi_sync_master_enabled={}, expected rpl_semi_sync_master_enabled=1",
+            rpl_semi_sync_master_enabled
+        );
+        exit(1);
+    } else {
+        log::info!(
+            "Rpl_semi_sync_master_enabled={}",
+            rpl_semi_sync_master_enabled
+        );
+    }
 
     let gtid_mode = match master_gtid_mode(&mut conn).await {
         Ok(v) => {
@@ -474,7 +553,12 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "OFF"
         }
     };
-    log::info!("Gtid_mode={:?}", gtid_mode);
+
+    if gtid_mode != "ON" {
+        log::warn!("Gtid_mode={:?}, expected open GTID mode", gtid_mode);
+    } else {
+        log::info!("Gtid_mode={:?}", gtid_mode);
+    }
 
     let gtid = binlog_gtid_pos(&mut conn, log_file_pos, log_file_name.as_bytes()).await?;
     log::info!(
@@ -483,7 +567,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Some(v) => v,
             None => String::new(),
         },
-        log_file_name.clone(), 
+        log_file_name.clone(),
         log_file_pos
     );
 
