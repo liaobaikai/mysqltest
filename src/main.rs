@@ -50,13 +50,7 @@ fn next_relaylog_file(
     relay_log_index: &str,
     current_relaylog: &mut String,
 ) -> std::result::Result<File, std::io::Error> {
-    // 只读取10个字节的文件后缀名
-    let seek_len: i64 = -((RELAY_LOG_SUFFIX_LEN + 1) as i64);
-    // ... \n
-    // \n
-    // seek_len += 2;
-    // emmm, only get extension.
-
+    
     let mut relay_log_index_file = OpenOptions::new()
         .write(true)
         .append(true)
@@ -64,6 +58,8 @@ fn next_relaylog_file(
         .create(true)
         .open(Path::new(relay_log_basename).join(relay_log_index))?;
 
+    // 只读取10个字节的文件后缀名
+    let seek_len: i64 = -((RELAY_LOG_SUFFIX_LEN + 1) as i64);
     let sequence = if let Ok(_size) = relay_log_index_file.seek(SeekFrom::End(seek_len)) {
         // relay-bin.000000001\n
         //           |----10--|
