@@ -12,7 +12,13 @@ use std::{
 
 use byteorder::{ByteOrder, LittleEndian};
 use futures_util::StreamExt;
-use mysql_async::{BinlogStreamRequest, Conn, OptsBuilder, Pool, binlog::BinlogChecksumAlg};
+use mysql_async::{
+    BinlogStreamRequest, Conn, OptsBuilder, Pool,
+    binlog::{
+        BinlogChecksumAlg,
+        events::{EventData},
+    },
+};
 use mysql_common::binlog::BinlogFileHeader;
 
 use crate::{
@@ -33,12 +39,6 @@ mod query;
 // relaylog日志编号长度: 000000001 ~ 999999999
 const RELAY_LOG_SUFFIX_LEN: usize = 9;
 
-// Hacky way to cut start [0 0 0 ...]
-fn strip_prefix(raw: &[u8]) -> &[u8] {
-    let pos = raw.iter().position(|&b| b != 0).unwrap_or(raw.len());
-    &raw[pos..]
-}
-
 // 创建一个新的relaylog文件
 //   读取index文件，获取最后一行，通过最后一行记录来计算下一个文件后缀
 // relay_log_basename: 基础路径
@@ -50,7 +50,6 @@ fn next_relaylog_file(
     relay_log_index: &str,
     current_relaylog: &mut String,
 ) -> std::result::Result<File, std::io::Error> {
-    
     let mut relay_log_index_file = OpenOptions::new()
         .write(true)
         .append(true)
@@ -165,20 +164,15 @@ async fn pull_binlog_events(
             exit(1);
         }
     };
+
     while let Some(event) = binlog_stream.next().await {
         let event = event?;
         log_file_pos = event.header().log_pos() as u64;
         // println!("event: {:?}", event);
         log::debug!("{:?}", event);
         log::debug!("Event checksum: {:?}", event.checksum());
-        // events_num += 1;
-        // assert that event type is known
-        let event_type = event.header().event_type()?;
-        match event_type {
-            // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_replication_binlog_event.html#sect_protocol_replication_event_rotate
-            // Binlog Management
-            // The first event is either a START_EVENT_V3 or a FORMAT_DESCRIPTION_EVENT while the last event is either a STOP_EVENT or ROTATE_EVENT.
-            mysql_async::binlog::EventType::ROTATE_EVENT => {
+        match event.read_data()?.unwrap() {
+            EventData::RotateEvent(ev) => {
                 // https://dev.mysql.com/doc/dev/mysql-server/latest/classmysql_1_1binlog_1_1event_1_1Rotate__event.html#details
                 // The layout of Rotate_event data part is as follows:
                 // +-----------------------------------------------------------------------+
@@ -187,37 +181,49 @@ async fn pull_binlog_events(
                 // 157 00, 00, 00, 00, 00, 00, 00, 62, 69, 6e, 6c, 6f, 67, 2e, 30, 30, 30, 30, 30, 31
                 // println!("ROTATE_EVENT::raw:: {:?}", event.data());
 
-                log::debug!("Event data: {:?}", event.data());
+                // https://github.com/blackbeam/mysql_async/issues/189
+                log::debug!("Event data: {:?}", ev);
 
                 // Position 8bytes
-                let mut pos_bytes = [0_u8; 8];
-                event.data().read_exact(&mut pos_bytes)?;
-                let pos = u64::from_le_bytes(pos_bytes);
-                log::debug!("ROTATE_EVENT pos: {}", pos);
+                // let mut pos_bytes = [0_u8; 8];
+                // event.data().read_exact(&mut pos_bytes)?;
+                // let pos = u64::from_le_bytes(pos_bytes);
+                // log::debug!("ROTATE_EVENT pos: {}", pos);
 
-                let should_binlog_bytes = &event.data()[8..];
+                // let should_binlog_bytes = &event.data()[8..];
                 // mariadb10.3.39: ROTATE_EVENT should_binlog_bytes: [109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104]
                 // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 49, 31, 14, 172, 104], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
                 // mysql8.0.41: ROTATE_EVENT should_binlog_bytes: [109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 57]
                 // Event { ..., data: [4, 0, 0, 0, 0, 0, 0, 0, 109, 121, 115, 113, 108, 45, 98, 105, 110, 46, 48, 48, 48, 48, 48, 52], footer: BinlogEventFooter { checksum_alg: Some(BINLOG_CHECKSUM_ALG_OFF), checksum_enabled: true }, checksum: [0, 0, 0, 0] }
-                let mut final_binlog_bytes = Vec::new();
-                for &byte in should_binlog_bytes {
+                // let mut final_binlog_bytes = Vec::new();
+                // for &byte in should_binlog_bytes {
+                //     if (32..=126).contains(&byte) {
+                //         final_binlog_bytes.push(byte);
+                //     } else {
+                //         // 遇到非可打印字符，终止提取
+                //         break;
+                //     }
+                // }
+
+                // log::debug!("ROTATE_EVENT calc_checksum: {}", event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32));
+                // log::debug!(
+                //     "ROTATE_EVENT should_binlog_bytes: {:?}, final_binlog_bytes: {:?}",
+                //     should_binlog_bytes,
+                //     final_binlog_bytes
+                // );
+                // log_file_name =
+                //     String::from_utf8_lossy(strip_prefix(&final_binlog_bytes)).to_string();
+                let mut raw = vec![];
+                for &byte in ev.name_raw() {
                     if (32..=126).contains(&byte) {
-                        final_binlog_bytes.push(byte);
+                        raw.push(byte);
                     } else {
                         // 遇到非可打印字符，终止提取
                         break;
                     }
                 }
-
-                // log::debug!("ROTATE_EVENT calc_checksum: {}", event.calc_checksum(BinlogChecksumAlg::BINLOG_CHECKSUM_ALG_CRC32));
-                log::debug!(
-                    "ROTATE_EVENT should_binlog_bytes: {:?}, final_binlog_bytes: {:?}",
-                    should_binlog_bytes,
-                    final_binlog_bytes
-                );
-                log_file_name =
-                    String::from_utf8_lossy(strip_prefix(&final_binlog_bytes)).to_string();
+                log_file_name = String::from_utf8_lossy(&raw).to_string();
+                log_file_pos = ev.position();
 
                 // new binlog file
                 // 如果上一个文件只有4个字节，那就不用切文件
@@ -239,6 +245,18 @@ async fn pull_binlog_events(
             }
             _ => {}
         }
+        // events_num += 1;
+        // assert that event type is known
+        // let event_type = event.header().event_type()?;
+        // match event_type {
+        //     // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_replication_binlog_event.html#sect_protocol_replication_event_rotate
+        //     // Binlog Management
+        //     // The first event is either a START_EVENT_V3 or a FORMAT_DESCRIPTION_EVENT while the last event is either a STOP_EVENT or ROTATE_EVENT.
+        //     mysql_async::binlog::EventType::ROTATE_EVENT => {
+
+        //     }
+        //     _ => {}
+        // }
 
         if let Some(skip_event) = config.replica.skip_event.clone() {
             match event.header().event_type() {
