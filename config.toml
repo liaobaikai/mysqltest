@@ -1,12 +1,12 @@
 [mysql]
-host = "localhost"
+host = "gzdsg.baikai.top"
 user = "root"
 pass = "123456"
-port = 4406
-# max_allowed_packet = 67108864
-# start_position = 4
-# start_filename = ""
-# init_sql=[]
+port = 4407
+max_allowed_packet = 102400
+start_position = 4
+start_filename = "mysql-bin.000001"
+init_sql=[]
 
 [replica]
 replica_id = 5000

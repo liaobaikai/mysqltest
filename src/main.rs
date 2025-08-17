@@ -278,6 +278,10 @@ async fn pull_binlog_events(
                     }
                 }
             }
+        } else {
+            log::info!(
+                "Slave semi-sync disabled",
+            );
         }
 
         // Checksum

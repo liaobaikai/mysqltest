@@ -19,8 +19,9 @@
                     "kind": "bin"
                 }
             },
+            "args": ["--start-filename=mysql-bin.000001", "-j4"],
             // "args": ["-pbaikai#1234", "-P3306", "--start-filename=mysql-bin.000004", "-j4"],
-            "args": ["-Hgzdsg.baikai.top", "-uroot", "-p123456", "-P4407", "--start-filename=mysql-bin.000001", "-j4"],
+            // "args": ["-Hgzdsg.baikai.top", "-uroot", "-p123456", "-P4407", "--start-filename=mysql-bin.000001", "-j4"],
             // "args": ["--start-filename=mysql-bin.000002", "-j4"],
             "cwd": "${workspaceFolder}"
         },

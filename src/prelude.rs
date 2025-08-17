@@ -224,12 +224,14 @@ pub fn prelude() -> std::result::Result<(MyConfig, Args, String, u64), Box<dyn s
         ),
     ];
 
-    if let Some(mut init_sql) = config.mysql.init_sql.clone() {
+    let sqls = if let Some(mut init_sql) = config.mysql.init_sql.clone() {
         init_sql.append(&mut init);
+        init_sql
     } else {
-        config.mysql.init_sql = Some(init);
-    }
+        init
+    };
 
+    config.mysql.init_sql = Some(sqls);
 
     Ok((config, args.clone(), log_file_name, log_file_pos))
 
