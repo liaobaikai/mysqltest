@@ -36,8 +36,8 @@ mod query;
 // pub const K_PACKET_FLAG_SYNC: u8 = 0x01;
 // pub const K_SYNC_HEADER: [u8; 2] = [K_PACKET_MAGIC_NUM, 0];
 
-// relaylog日志编号长度: 000000001 ~ 999999999
-const RELAY_LOG_SUFFIX_LEN: usize = 9;
+// relaylog日志编号长度: 000001 ~ 999999
+const RELAY_LOG_SUFFIX_LEN: usize = 6;
 
 // 创建一个新的relaylog文件
 //   读取index文件，获取最后一行，通过最后一行记录来计算下一个文件后缀
@@ -81,7 +81,7 @@ fn next_relaylog_file(
     let relaylog_file_path = Path::new(relay_log_basename).join(format!(
         "{}.{}",
         relay_log,
-        format!("{:>09}", sequence + 1)
+        format!("{:>0RELAY_LOG_SUFFIX_LEN$}", sequence + 1)
     ));
     let mut relaylog_file = OpenOptions::new()
         .read(true)

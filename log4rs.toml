@@ -49,5 +49,5 @@ base = 1
 # base = 1
 
 [root]
-level = "debug"
+level = "info"
 appenders = [ "file", "stdout" ]

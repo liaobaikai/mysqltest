@@ -17,9 +17,9 @@ datadir = "./data"
 
 # Relay Log Section
 # Default Value: datadir + '/' + 'relay-bin'
-relay_log_basename = "./data/relay-bin/"
-relay_log = "relay-bin"
-relay_log_index = "relay-bin.index"
+relay_log_basename = "./data/binlog/"
+relay_log = "mysql-bin"
+relay_log_index = "mysql-bin.index"
 # Unused.
 relay_log_purge = 1
 # Unused.
